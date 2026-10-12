@@ -1,0 +1,87 @@
+name: Sync from upstream
+
+# Keeps this mirror in step with the repository named in UPSTREAM: every
+# upstream branch and tag is re-pushed here once a day, forced, so a rewritten
+# upstream branch is followed rather than refused. Only this ci-mirror branch
+# is ours; it is never touched by the sync, which is why it can hold the
+# workflow at all. The repository's own token does the push, so there is no
+# personal token to expire.
+#
+# One push for everything first. If GitHub refuses it -- cairo's history has
+# two commits whose author lines fail GitHub's object check, and one bad
+# object fails the whole pack -- every ref is pushed on its own, so the refs
+# that can land do, and the ones that cannot are named in the job summary. A
+# tag the mirror cannot hold is not a broken build: the build's clone helper
+# falls back to upstream for a tag the mirror does not serve.
+#
+# GitHub disables a schedule in a repository with no activity for 60 days, and
+# a quiet upstream would get there. The last step commits a timestamp to this
+# branch on every run, which is activity enough to keep the schedule alive.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Push every upstream branch and tag
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream=$(tr -d '[:space:]' < UPSTREAM)
+          case "$upstream" in
+            https://gitlab.freedesktop.org/*|https://gitlab.gnome.org/*|https://code.videolan.org/*|https://bitbucket.org/*|https://*.googlesource.com/*|https://gitlab.com/*|https://git.savannah.gnu.org/*) ;;
+            *) echo "::error::UPSTREAM is not a host this mirror is for: $upstream"; exit 1 ;;
+          esac
+          for i in 1 2 3 4; do
+            git clone --quiet --bare "$upstream" /tmp/upstream && break
+            echo "clone attempt $i failed; waiting"; rm -rf /tmp/upstream; sleep $((i * 30))
+          done
+          [ -d /tmp/upstream ] || { echo "::error::upstream unreachable after 4 attempts"; exit 1; }
+          cd /tmp/upstream
+          here="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          total=$(git for-each-ref refs/heads refs/tags | wc -l)
+          echo "$(git for-each-ref refs/heads | wc -l) branches, $(git for-each-ref refs/tags | wc -l) tags"
+          if git push --quiet --force "$here" 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'; then
+            echo "all ${total} refs pushed in one go"
+            exit 0
+          fi
+          echo "::warning::the single push was refused; pushing ref by ref"
+          failed=""
+          for ref in $(git for-each-ref --format='%(refname)' refs/heads refs/tags); do
+            git push --quiet --force "$here" "${ref}:${ref}" >/dev/null 2>&1 || failed="${failed} ${ref}"
+          done
+          n=$(echo $failed | wc -w)
+          if [ "$n" -eq "$total" ]; then
+            echo "::error::not one of ${total} refs could be pushed"; exit 1
+          fi
+          echo "$((total - n)) of ${total} refs pushed; ${n} refused by GitHub:${failed}"
+          {
+            echo "## ${n} of ${total} refs could not be pushed"
+            echo "GitHub refuses objects in their history (its object check); the build falls back to upstream for these."
+            for ref in $failed; do echo "- \`${ref}\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record the sync
+        run: |
+          set -euo pipefail
+          date -u +%FT%TZ > LAST_SYNC
+          git config user.name mirror-sync
+          git config user.email mirror-sync@users.noreply.github.com
+          git add LAST_SYNC
+          git commit -qm "sync $(cat LAST_SYNC)"
+          git push --quiet
