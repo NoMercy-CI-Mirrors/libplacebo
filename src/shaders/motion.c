@@ -156,11 +156,6 @@ static void bind_buf(pl_shader sh, const char *name, pl_buf buf,
 #define MOTION_BPGX 2
 #define MOTION_BPGY 5
 
-// Use a sufficiently large workgroup size of
-// (MOTION_MEDIAN_WORKGROUP_DIM, MOTION_MEDIAN_WORKGROUP_DIM) for median
-// filtering shader pass.
-#define MOTION_MEDIAN_WORKGROUP_DIM 16
-
 // Total number of bins considered when creating the histogram of global
 // motion. NOTE: if the median motion is outside of [-`MOTION_GLOBAL_BINS/2`,
 // `MOTION_GLOBAL_BINS-1`], the global motion is clamped.
@@ -1296,79 +1291,116 @@ error:
 
 // Replace every block's motion vector with one derived from the surrounding 3x3
 // neighbourhood of blocks, to suppress vectors that the search got wrong.
-static bool motion_smooth_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex in,
-                               pl_tex out)
+static bool motion_smooth_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
+                               pl_tex ref, pl_tex tgt, pl_tex in, pl_tex out)
 {
     const int grid_w = out->params.w, grid_h = out->params.h;
+    const int tex_w = ref->params.w, tex_h = ref->params.h;
 
-    int bw = MOTION_MEDIAN_WORKGROUP_DIM;
-    int bh = MOTION_MEDIAN_WORKGROUP_DIM;
+    // A work group covers `gx` x `gy` blocks, with one thread per row
+    const int gx = PL_CLAMP(64 / bs, 1, 8), gy = 4;
+    const int bw = gx * bs, bh = gy;
+    const size_t shmem = bw * bh * 8 * sizeof(float);
 
     pl_shader sh = pl_dispatch_begin(dispatch);
     sh_describef(sh, "motion vector smoothing (3x3, %dx%d blocks)", grid_w,
                  grid_h);
     sh->output = PL_SHADER_SIG_NONE;
 
-    if (!sh_try_compute(sh, bw, bh, false, 0)) {
+    if (!sh_try_compute(sh, bw, bh, false, shmem)) {
         PL_ERR(gpu,
                "pl_motion_estimate: cannot create motion vector smoothing "
-               "shader, needs %dx%d threads per work group!",
-               bw, bh);
+               "shader, needs %dx%d threads and %zu bytes of shared memory per "
+               "work group!",
+               bw, bh, shmem);
         goto error;
     }
 
     ident_t src = bind_tex(sh, "flow_in", in);
     ident_t dst = bind_img(sh, "flow_out", out);
+    ident_t ref_id = bind_tex(sh, "ref", ref);
+
+    // The vectors are fractional
+    ident_t tgt_pt, tgt_id = sh_bind(sh, tgt, PL_TEX_ADDRESS_CLAMP,
+                                     PL_TEX_SAMPLE_LINEAR, "tgt", NULL, NULL,
+                                     &tgt_pt);
+    if (!tgt_id)
+        goto error;
 
     // clang-format off
 #pragma GLSLH /* motion_smooth_pass */                                          \
-    /* Branchless, element-wise comparator to use in the sorting network. */    \
-    void sort2(inout vec2 a, inout vec2 b) {                                    \
-        vec2 lo = min(a, b);                                                    \
-        b = max(a, b);                                                          \
-        a = lo;                                                                 \
-    }                                                                           \
-                                                                                \
-    /* Sort 9 elements residing in registers using a sorting network. Sorting   \
-     * network from https://bertdobbelaere.github.io/sorting_networks.html or   \
-     * SorterHunter. */                                                         \
-    void sort9(inout vec2 a, inout vec2 b, inout vec2 c, inout vec2 d,          \
-               inout vec2 e, inout vec2 f, inout vec2 g, inout vec2 h,          \
-               inout vec2 i) {                                                  \
-        sort2(c,f); sort2(a,d); sort2(e,i); sort2(b,h);                         \
-        sort2(a,h); sort2(c,e); sort2(f,g); sort2(d,i);                         \
-        sort2(a,c); sort2(b,d); sort2(e,f); sort2(h,i);                         \
-        sort2(b,e); sort2(f,h); sort2(d,g);                                     \
-        sort2(c,e); sort2(a,b); sort2(d,f); sort2(g,i);                         \
-        sort2(c,d); sort2(e,f); sort2(g,h);                                     \
-        sort2(b,c); sort2(d,e); sort2(f,g);                                     \
-    }                                                                           \
+    /* SSD of each neighbour over each row of each block of the group. */       \
+    shared float s_ssd[${const int: bw * bh * 8}];
     // clang-format on
 
     // clang-format off
 #pragma GLSL /* motion_smooth_pass */                                           \
     ivec2 grid = ivec2(${const int: grid_w}, ${const int: grid_h});             \
-    ivec2 blk  = ivec2(gl_GlobalInvocationID.xy);                               \
-    if (all(lessThan(blk, grid))) {                                             \
-        /* The 3x3 neighbourhood around this block, clamped. */                 \
-        vec2 mv[9];                                                             \
-        for (int i = 0; i < 9; i++) {                                           \
-            ivec2 p = clamp(blk + ivec2(i % 3, i / 3) - 1, ivec2(0), grid - 1); \
-            mv[i] = texelFetch($src, p, 0).xy;                                  \
+    ivec2 size = ivec2(${const int: tex_w}, ${const int: tex_h});               \
+    ivec2 tid  = ivec2(gl_LocalInvocationID.xy);                                \
+    int row    = tid.x % ${const int: bs};                                      \
+    ivec2 blk  = ivec2(gl_WorkGroupID.xy) *                                     \
+                 ivec2(${const int: gx}, ${const int: gy}) +                    \
+                 ivec2(tid.x / ${const int: bs}, tid.y);                        \
+    int base   = (tid.y * ${const int: bw} + tid.x) * 8;                        \
+                                                                                \
+    /* The 3x3 neighbourhood around this block, clamped. */                     \
+    vec2 mv[9];                                                                 \
+    for (int i = 0; i < 9; i++) {                                               \
+        ivec2 p = clamp(blk + ivec2(i % 3, i / 3) - 1, ivec2(0), grid - 1);     \
+        mv[i] = texelFetch($src, p, 0).xy;                                      \
+    }                                                                           \
+                                                                                \
+    /* Take the vector of the neighbour that matches the block best. Every      \
+     * thread matches its own row of the block against the vectors of the 8     \
+     * neighbours. The block's own vector is left out: the search already       \
+     * preferred it over every vector it tried, usually including those of      \
+     * the neighbours, so it would win exactly where its match is               \
+     * ambiguous. */                                                            \
+    float ssd[8];                                                               \
+    for (int k = 0; k < 8; k++)                                                 \
+        ssd[k] = 0.0;                                                           \
+    for (int j = 0; j < ${const int: bs}; j++) {                                \
+        ivec2 pos = min(blk * ${const int: bs} + ivec2(j, row), size - 1);      \
+        float r = texelFetch($ref_id, pos, 0).r;                                \
+        vec2 c = vec2(pos) + vec2(0.5);                                         \
+        for (int k = 0; k < 8; k++) {                                           \
+            vec2 v = mv[k < 4 ? k : k + 1].xy;                                  \
+            float d = r - textureLod($tgt_id, (c + v) * $tgt_pt, 0.0).r;        \
+            ssd[k] += d * d;                                                    \
+        }                                                                       \
+    }                                                                           \
+    for (int k = 0; k < 8; k++)                                                 \
+        s_ssd[base + k] = ssd[k];                                               \
+    barrier();                                                                  \
+                                                                                \
+    if (all(lessThan(blk, grid)) && row == 0) {                                 \
+        /* Without any neighbour inside the grid, keep the block's vector. */   \
+        vec2 best = mv[4].xy;                                                   \
+        float best_ssd = 1e30;                                                  \
+        for (int k = 0; k < 8; k++) {                                           \
+            int i = k < 4 ? k : k + 1;                                          \
+            ivec2 p = blk + ivec2(i % 3, i / 3) - 1;                            \
+            float sum = 0.0;                                                    \
+            for (int j = 0; j < ${const int: bs}; j++)                          \
+                sum += s_ssd[base + j * 8 + k];                                 \
+            bool inside = all(equal(p, clamp(p, ivec2(0), grid - 1)));          \
+            if (inside && sum < best_ssd) {                                     \
+                best = mv[i].xy;                                                \
+                best_ssd = sum;                                                 \
+            }                                                                   \
         }                                                                       \
                                                                                 \
-        sort9(mv[0], mv[1], mv[2], mv[3], mv[4], mv[5], mv[6], mv[7], mv[8]);   \
-                                                                                \
-        /* Take median of sorted elements. The confidence is always 1. */       \
-        imageStore($dst, blk, vec4(mv[4], 1.0, 0.0));                           \
+        /* The confidence is always 1. */                                       \
+        imageStore($dst, blk, vec4(best, 1.0, 0.0));                            \
     }
     // clang-format on
 
     const struct pl_dispatch_compute_params *params = pl_dispatch_compute_params(
         .shader = &sh,
         .dispatch_size = {
-            PL_DIV_UP(grid_w, bw),
-            PL_DIV_UP(grid_h, bh),
+            PL_DIV_UP(grid_w, gx),
+            PL_DIV_UP(grid_h, gy),
             1,
         },
     );
@@ -1790,7 +1822,8 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
             if (!ok)
                 break;
 
-            ok = motion_smooth_pass(gpu, input->dispatch, raw, out);
+            ok = motion_smooth_pass(gpu, input->dispatch, params->block_size,
+                                    fwd ? a : b, fwd ? b : a, raw, out);
             if (!ok)
                 break;
         }
