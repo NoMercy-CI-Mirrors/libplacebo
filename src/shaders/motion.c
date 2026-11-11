@@ -168,6 +168,14 @@ static void bind_buf(pl_shader sh, const char *name, pl_buf buf,
 // mean squared error per pixel in 8 bit code values.
 #define MOTION_REFINE_MARGIN 1.0f
 
+// Mismatch, relative to the texture energy of the window, at which
+// `motion_refine_pass` halves the confidence of a pixel's vector.
+#define MOTION_REFINE_OCCLUSION 0.3f
+
+// Added to the texture energy that the mismatch is relative to, to keep it
+// finite in flat areas, as a mean squared error per pixel in 8 bit code values.
+#define MOTION_REFINE_FLAT 1.0f
+
 // Total number of bins considered when creating the histogram of global
 // motion. NOTE: if the median motion is outside of [-`MOTION_GLOBAL_BINS/2`,
 // `MOTION_GLOBAL_BINS-1`], the global motion is clamped.
@@ -1445,7 +1453,12 @@ error:
 // better by more than `MOTION_REFINE_MARGIN`. This follows motion boundaries
 // within a block, which a single vector per block cannot.
 //
-// The confidence is that of the block whose vector was taken.
+// The confidence estimates whether the pixel is visible in the other frame. It
+// falls with the mismatch: the geometric mean of the SSD of the vector taken
+// and the mean SSD of all candidates, relative to the texture energy of the
+// window. Including the other candidates makes this larger at motion
+// boundaries, where occlusions happen. Vectors that lead out of the frame get
+// no confidence at all.
 static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
                                pl_tex ref, pl_tex tgt, pl_tex flow, pl_tex out)
 {
@@ -1481,8 +1494,9 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
         goto error;
 
     // SSD over the window, in units of the luma textures
-    const float margin =
-        MOTION_REFINE_MARGIN * PL_SQUARE(win) / (255.0f * 255.0f);
+    const float scale = PL_SQUARE(win) / (255.0f * 255.0f);
+    const float margin = MOTION_REFINE_MARGIN * scale;
+    const float flat = MOTION_REFINE_FLAT * scale;
 
     // clang-format off
 #pragma GLSLH /* motion_refine_pass */                                          \
@@ -1515,8 +1529,24 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
         cand[k] = texelFetch($src, p, 0).xyz;                                   \
     }                                                                           \
                                                                                 \
+    /* Texture energy of the window: its squared differences to its centre */   \
+    for (int l = 0; l < ${const int: per_thread}; l++) {                        \
+        int j = int(gl_LocalInvocationIndex) + l * ${const int: dim * dim};     \
+        if (j < ${const int: tile * tile})                                      \
+            s_diff[j] = r[l];                                                   \
+    }                                                                           \
+    barrier();                                                                  \
+    float centre = s_diff[(local.y + ${const int: win / 2}) * ${const int: tile}\
+                          + local.x + ${const int: win / 2}];                   \
+    float energy = 0.0;                                                         \
+    for (int j = 0; j < ${const int: win * win}; j++) {                         \
+        float d = s_diff[(local.y + j / ${const int: win}) * ${const int: tile} \
+                         + local.x + j % ${const int: win}] - centre;           \
+        energy += d * d;                                                        \
+    }                                                                           \
+                                                                                \
     vec3 best = cand[0];                                                        \
-    float best_ssd = 0.0;                                                       \
+    float best_ssd = 0.0, best_raw = 0.0, mean_ssd = 0.0;                       \
     for (int k = 0; k < 9; k++) {                                               \
         barrier();                                                              \
         for (int l = 0; l < ${const int: per_thread}; l++) {                    \
@@ -1528,19 +1558,28 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
         }                                                                       \
         barrier();                                                              \
                                                                                 \
-        float ssd = k == 0 ? 0.0 : ${float: margin};                            \
+        float raw = 0.0;                                                        \
         for (int j = 0; j < ${const int: win * win}; j++) {                     \
-            ssd += s_diff[(local.y + j / ${const int: win}) * ${const int: tile}\
+            raw += s_diff[(local.y + j / ${const int: win}) * ${const int: tile}\
                           + local.x + j % ${const int: win}];                   \
         }                                                                       \
+        mean_ssd += raw / 9.0;                                                  \
+        float ssd = k == 0 ? raw : raw + ${float: margin};                      \
         if (k == 0 || ssd < best_ssd) {                                         \
             best = cand[k];                                                     \
             best_ssd = ssd;                                                     \
+            best_raw = raw;                                                     \
         }                                                                       \
     }                                                                           \
                                                                                 \
+    float mismatch = sqrt(best_raw * mean_ssd) / (energy + ${float: flat});     \
+    float conf = 1.0 / (1.0 + mismatch / ${float: MOTION_REFINE_OCCLUSION});    \
+    vec2 to = vec2(pos) + vec2(0.5) + best.xy;                                  \
+    if (any(lessThan(to, vec2(0.0))) || any(greaterThan(to, vec2(size))))      \
+        conf = 0.0;                                                             \
+                                                                                \
     if (all(lessThan(sub, ivec2(${const int: bs}))) && all(lessThan(pos, size)))\
-        imageStore($dst, pos, vec4(best, 0.0));
+        imageStore($dst, pos, vec4(best.xy, conf, 0.0));
     // clang-format on
 
     const struct pl_dispatch_compute_params *params = pl_dispatch_compute_params(

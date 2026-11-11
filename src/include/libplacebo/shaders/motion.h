@@ -161,7 +161,10 @@ PL_API void pl_motion_reset(pl_shader_obj state);
 // fractional, and `confidence` is in the range [0, 1], with 1 meaning high
 // confidence. Any further components are unspecified. Sample the field with
 // `PL_TEX_SAMPLE_NEAREST` (or `texelFetch`).
-// NOTE: the confidence is currently always 1.
+//
+// The confidence estimates whether the pixel is visible in the other frame,
+// i.e. neither occluded nor moved out of the frame. It also drops where the
+// vector matches badly.
 PL_API pl_tex pl_motion_get_flow(pl_shader_obj state,
                                  enum pl_motion_direction dir);
 
