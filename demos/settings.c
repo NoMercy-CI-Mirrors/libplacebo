@@ -429,6 +429,7 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
             static const char *interp_algos[PL_FRAME_INTERP_ALGO_COUNT] = {
                 [PL_FRAME_INTERP_GLOBAL_MOTION] = "Global motion",
                 [PL_FRAME_INTERP_VISUALIZE]     = "Visualize motion vectors",
+                [PL_FRAME_INTERP_LOCAL_MOTION]  = "Local motion (experimental)",
             };
 
             nk_label(nk, "Algorithm", NK_TEXT_LEFT);
@@ -442,6 +443,27 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                             &mpar->search_radius_coarse, 32, 1, 1);
             nk_property_int(nk, "Fine search radius", 0,
                             &mpar->search_radius_fine, 32, 1, 1);
+
+            if (ipar->algo == PL_FRAME_INTERP_LOCAL_MOTION) {
+                struct pl_frame_interp_local_params *lm = &ipar->local;
+                nk_checkbox_label(nk, "Bidirectional", &lm->bidir);
+                nk_property_float(nk, "Lattice pitch (flow px)", 1.0f, &lm->pitch,
+                                  32.0f, 0.5f, 0.05f);
+                nk_property_int(nk, "Lookup iterations", 0, &lm->iterations,
+                                8, 1, 1);
+                nk_property_float(nk, "Confidence low", 0.0f, &lm->conf_lo,
+                                  1.0f, 0.01f, 0.001f);
+                nk_property_float(nk, "Confidence high", 0.0f, &lm->conf_hi,
+                                  1.0f, 0.01f, 0.001f);
+                nk_property_float(nk, "Global motion weight", 0.0f,
+                                  &lm->global, 1.0f, 0.01f, 0.001f);
+                nk_property_float(nk, "Mismatch tolerance", 0.0f, &lm->sigma,
+                                  1.0f, 0.01f, 0.001f);
+                nk_property_float(nk, "Sharp merge (flow px)", 0.0f, &lm->sharp,
+                                  8.0f, 0.1f, 0.01f);
+                nk_property_float(nk, "Fallback weight", 0.0f, &lm->fallback,
+                                  1.0f, 0.01f, 0.001f);
+            }
             nk_tree_pop(nk);
         }
 

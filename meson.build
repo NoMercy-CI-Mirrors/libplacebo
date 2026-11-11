@@ -12,6 +12,7 @@ project('libplacebo', ['c', 'cpp'],
     7,
     # API version
     {
+      '393': 'add PL_FRAME_INTERP_LOCAL_MOTION and pl_frame_interp_params.local',
       '392': 'add pl_frame_interp_algo PL_FRAME_INTERP_VISUALIZE',
       '391': 'add pl_render_stage enum value PL_RENDER_STAGE_MOTION',
       '390': 'add pl_frame_interp_input and pl_shader_frame_interp',

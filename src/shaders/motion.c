@@ -21,6 +21,7 @@
 
 #include "shaders.h"
 #include "shaders/motion.h"
+#include "dispatch.h"
 
 #include <libplacebo/shaders/colorspace.h>
 #include <libplacebo/shaders/motion.h>
@@ -2230,6 +2231,286 @@ static bool frame_interp_visualize(pl_shader sh,
     return true;
 }
 
+// --- EXPERIMENTAL: PL_FRAME_INTERP_LOCAL_MOTION ---------------------------
+//
+// Every output pixel is a mix of both frames compensated by a handful of
+// candidate motion vectors: the global motion, and the per pixel flow of
+// each direction at the four points of a coarse lattice around the pixel.
+// Each candidate weighs in by how close and how confident its lattice point
+// is, and by how well the two samples it fetches agree with each other,
+// relative to the best candidate. Where the candidates agree on the motion,
+// the frames are instead resampled once along their mean with a sharper
+// filter. Whatever weight the candidates' confidence leaves unclaimed goes to
+// plain frame mixing.
+//
+// The flow fields are anchored to their source frame, whereas a lattice point
+// lies in the frame being synthesized. So the flow is not read at the point
+// itself, but where its content came from, found by fixed point iteration.
+//
+// Tunables live in `pl_frame_interp_params.local`.
+
+static bool frame_interp_local(pl_shader sh,
+                               const struct pl_frame_interp_input *input,
+                               const struct pl_frame_interp_params *params,
+                               const struct pl_color_space *out_color)
+{
+    pl_tex flows[2] = {
+        pl_motion_get_flow(*input->state, PL_MOTION_FORWARD),
+        pl_motion_get_flow(*input->state, PL_MOTION_BACKWARD),
+    };
+    if (!flows[0]) {
+        PL_ERR(sh, "pl_shader_frame_interp: no flow field available!");
+        return false;
+    }
+
+    const struct pl_frame_interp_local_params *lm = &params->local;
+    const float t = PL_CLAMP(input->t, 0.0f, 1.0f);
+    const int ndir = lm->bidir && flows[1] ? 2 : 1;
+
+    // Emit the color conversion of each frame as a function, so it can be
+    // applied to every candidate's sample without duplicating it.
+    const struct pl_motion_estimate_frame *frames[2] = { &input->a, &input->b };
+    ident_t conv[2];
+    for (int i = 0; i < 2; i++) {
+        pl_shader sub = pl_dispatch_begin_ex(input->dispatch, true);
+        if (sub->prefix == sh->prefix) {
+            // The first unique identifier may coincide with `sh`'s, which
+            // `sh_subpass` rejects.
+            pl_dispatch_abort(input->dispatch, &sub);
+            sub = pl_dispatch_begin_ex(input->dispatch, true);
+        }
+        sh_require(sub, PL_SHADER_SIG_COLOR, 0, 0);
+        struct pl_color_repr repr = frames[i]->repr;
+        struct pl_color_space csp = frames[i]->color;
+        pl_color_space_infer(&csp);
+        if (!pl_color_space_equal(&csp, out_color)) {
+            pl_shader_set_alpha(sub, &repr, PL_ALPHA_INDEPENDENT);
+            pl_shader_color_map_ex(sub, NULL, pl_color_map_args(csp, *out_color));
+        }
+        pl_shader_set_alpha(sub, &repr, PL_ALPHA_PREMULTIPLIED);
+        conv[i] = sh_subpass(sh, sub);
+        pl_dispatch_abort(input->dispatch, &sub);
+        if (!conv[i])
+            return false;
+    }
+
+    const struct pl_tex_params *tpars = &input->a.tex->params;
+    if (!sh_require(sh, PL_SHADER_SIG_NONE, tpars->w, tpars->h))
+        return false;
+    sh_describe(sh, "frame interpolation (local motion)");
+
+    ident_t tex[2], pos[2], pt[2];
+    for (int i = 0; i < 2; i++) {
+        pl_tex tx = frames[i]->tex;
+        enum pl_tex_sample_mode mode = PL_TEX_SAMPLE_NEAREST;
+        if (tx->params.format->caps & PL_FMT_CAP_LINEAR)
+            mode = PL_TEX_SAMPLE_LINEAR;
+        tex[i] = sh_bind(sh, tx, PL_TEX_ADDRESS_CLAMP, mode, "frame", NULL,
+                         &pos[i], &pt[i]);
+        if (!tex[i])
+            return false;
+    }
+
+    ident_t gm = NULL_IDENT;
+    if (lm->global > 0.0f)
+        gm = sh_motion_global(sh, *input->state, PL_MOTION_FORWARD);
+
+    // The flow fields need not measure the same as the frames.
+    const int flow_w = flows[0]->params.w, flow_h = flows[0]->params.h;
+    const float flow_sx = (float) flow_w / tpars->w;
+    const float flow_sy = (float) flow_h / tpars->h;
+    // Distances are given in pixels of the flow fields, so that the result
+    // does not depend on the scale the motion was estimated at.
+    const float pitch = PL_MAX(lm->pitch, 1.0f);
+    const float pitch_x = pitch / flow_sx, pitch_y = pitch / flow_sy;
+    const int iters = PL_MAX(lm->iterations, 0);
+    const bool photo = lm->sigma > 0.0f;
+    const bool sharp = lm->sharp > 0.0f;
+    const float inv_sigma2 = 1.0f / PL_MAX(PL_SQUARE(lm->sigma), 1e-8f);
+    const float inv_sharp2 = flow_sx * flow_sy /
+                             PL_MAX(PL_SQUARE(lm->sharp), 1e-8f);
+    const float prior_max = 1.0f + (gm ? lm->global : 0.0f);
+    const int num = 4 * ndir + (gm ? 1 : 0);
+
+    // clang-format off
+#pragma GLSLH /* frame_interp_local */                                          \
+    vec4 lm_sample_a(vec2 p) { return ${conv[0]}(textureLod(${tex[0]}, p, 0.0)); }\
+    vec4 lm_sample_b(vec2 p) { return ${conv[1]}(textureLod(${tex[1]}, p, 0.0)); }\
+                                                                                \
+    float lm_inside(vec2 p) {                                                   \
+        return all(greaterThanEqual(p, vec2(0.0))) &&                           \
+               all(lessThanEqual(p, vec2(1.0))) ? 1.0 : 0.0;                    \
+    }                                                                           \
+                                                                                \
+    float lm_luma(vec4 c) {                                                     \
+        return sqrt(max(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0));        \
+    }                                                                           \
+                                                                                \
+    /* Mix both frames compensated by the motion `mv` (in source pixels), and   \
+     * return the mismatch between the two samples in `err`. */                 \
+    vec4 lm_pair(vec2 pa, vec2 pb, vec2 mv, float t, out float err) {           \
+        vec2 qa = pa - t * mv * ${pt[0]};                                       \
+        vec2 qb = pb + (1.0 - t) * mv * ${pt[1]};                               \
+        vec4 ca = lm_sample_a(qa);                                              \
+        vec4 cb = lm_sample_b(qb);                                              \
+        float wa = (1.0 - t) * lm_inside(qa);                                   \
+        float wb = t * lm_inside(qb);                                           \
+        /* Without both samples there is no evidence either way. */             \
+        err = wa > 0.0 && wb > 0.0 ? abs(lm_luma(ca) - lm_luma(cb))             \
+                                   : ${float: lm->sigma};                       \
+        return wa + wb > 0.0 ? (wa * ca + wb * cb) / (wa + wb)                  \
+                             : mix(ca, cb, t);                                  \
+    }
+    // clang-format on
+
+    if (sharp) {
+        ident_t cubic[2];
+        for (int i = 0; i < 2; i++) {
+            cubic[i] = sh_fresh(sh, "lm_cubic");
+            // clang-format off
+#pragma GLSLH /* frame_interp_local */                                          \
+    /* Catmull-Rom, with the inner 2x2 taps folded into one bilinear fetch. */  \
+    vec4 ${cubic[i]}(vec2 p) {                                                  \
+        vec2 pt = ${pt[i]};                                                     \
+        vec2 c  = floor(p / pt - 0.5) + 0.5;                                    \
+        vec2 f  = p / pt - c;                                                   \
+        vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));                             \
+        vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);                               \
+        vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));                              \
+        vec2 w3 = f * f * (-0.5 + 0.5 * f);                                     \
+        vec2 w12 = w1 + w2;                                                     \
+        vec2 p0  = (c - 1.0) * pt;                                              \
+        vec2 p12 = (c + w2 / w12) * pt;                                         \
+        vec2 p3  = (c + 2.0) * pt;                                              \
+        return ${conv[i]}(                                                      \
+            (textureLod(${tex[i]}, vec2(p0.x,  p0.y),  0.0) * w0.x  +           \
+             textureLod(${tex[i]}, vec2(p12.x, p0.y),  0.0) * w12.x +           \
+             textureLod(${tex[i]}, vec2(p3.x,  p0.y),  0.0) * w3.x) * w0.y +    \
+            (textureLod(${tex[i]}, vec2(p0.x,  p12.y), 0.0) * w0.x  +           \
+             textureLod(${tex[i]}, vec2(p12.x, p12.y), 0.0) * w12.x +           \
+             textureLod(${tex[i]}, vec2(p3.x,  p12.y), 0.0) * w3.x) * w12.y +   \
+            (textureLod(${tex[i]}, vec2(p0.x,  p3.y),  0.0) * w0.x  +           \
+             textureLod(${tex[i]}, vec2(p12.x, p3.y),  0.0) * w12.x +           \
+             textureLod(${tex[i]}, vec2(p3.x,  p3.y),  0.0) * w3.x) * w3.y);    \
+    }
+            // clang-format on
+        }
+
+        // clang-format off
+#pragma GLSLH /* frame_interp_local */                                          \
+    vec4 lm_pair_sharp(vec2 pa, vec2 pb, vec2 mv, float t) {                    \
+        vec2 qa = pa - t * mv * ${pt[0]};                                       \
+        vec2 qb = pb + (1.0 - t) * mv * ${pt[1]};                               \
+        vec4 ca = ${cubic[0]}(qa);                                              \
+        vec4 cb = ${cubic[1]}(qb);                                              \
+        float wa = (1.0 - t) * lm_inside(qa);                                   \
+        float wb = t * lm_inside(qb);                                           \
+        return wa + wb > 0.0 ? (wa * ca + wb * cb) / (wa + wb)                  \
+                             : mix(ca, cb, t);                                  \
+    }
+        // clang-format on
+    }
+
+    // clang-format off
+#pragma GLSL /* frame_interp_local */                                           \
+    vec4 color;                                                                 \
+    {                                                                           \
+    float t = ${dynamic float: t};                                              \
+    vec2 pa = ${pos[0]}, pb = ${pos[1]};                                        \
+    /* Candidates: their sample, motion, weight and mismatch. */                \
+    vec4 ck[9];                                                                 \
+    vec2 vk[9];                                                                 \
+    float wk[9], ek[9];                                                         \
+    ivec2 last = ivec2(${const int: flow_w}, ${const int: flow_h}) - 1;         \
+    vec2 fscale = vec2(${const float: flow_sx}, ${const float: flow_sy});       \
+    /* The lattice, in source pixels. */                                        \
+    vec2 pitch = vec2(${float: pitch_x}, ${float: pitch_y});                    \
+    vec2 grid = pa * vec2(${const float: tpars->w}, ${const float: tpars->h})   \
+              / pitch - 0.5;                                                    \
+    vec2 base = floor(grid);                                                    \
+    vec2 frac = grid - base;
+    // clang-format on
+
+    for (int d = 0; d < ndir; d++) {
+        ident_t flow = bind_tex(sh, "lm_flow", flows[d]);
+        // The backward field holds the displacement from frame `b` to `a`,
+        // and its content has `1 - t` of the frame interval to go.
+        const float sign = d ? -1.0f : 1.0f;
+        // clang-format off
+#pragma GLSL /* frame_interp_local */                                           \
+    for (int i = 0; i < 4; i++) {                                               \
+        vec2 off = vec2(i & 1, i >> 1);                                         \
+        vec2 x = (base + off + 0.5) * pitch;                                    \
+        float tau = abs(${const float: d} - t);                                 \
+        vec3 f = texelFetch($flow, clamp(ivec2(floor(x * fscale)),              \
+                                         ivec2(0), last), 0).xyz;               \
+        for (int n = 0; n < ${const int: iters}; n++) {                         \
+            f = texelFetch($flow, clamp(ivec2(floor((x - tau * f.xy) * fscale)),\
+                                        ivec2(0), last), 0).xyz;                \
+        }                                                                       \
+        vec2 w = mix(1.0 - frac, frac, off);                                    \
+        int k = ${const int: 4 * d} + i;                                        \
+        vk[k] = ${const float: sign} * f.xy;                                    \
+        wk[k] = w.x * w.y * ${const float: 1.0f / ndir}                         \
+              * smoothstep(${float: lm->conf_lo}, ${float: lm->conf_hi}, f.z);  \
+        ck[k] = lm_pair(pa, pb, vk[k], t, ek[k]);                               \
+    }
+        // clang-format on
+    }
+
+    if (gm) {
+        // clang-format off
+#pragma GLSL /* frame_interp_local */                                           \
+    vk[${const int: num - 1}] = $gm.xy;                                         \
+    wk[${const int: num - 1}] = ${float: lm->global};                           \
+    ck[${const int: num - 1}] = lm_pair(pa, pb, $gm.xy, t, ek[${const int: num - 1}]);
+        // clang-format on
+    }
+
+    // clang-format off
+#pragma GLSL /* frame_interp_local */                                           \
+    @if (photo) {                                                               \
+        float emin = 1e9;                                                       \
+        for (int k = 0; k < ${const int: num}; k++) {                           \
+            if (wk[k] > 0.0)                                                    \
+                emin = min(emin, ek[k]);                                        \
+        }                                                                       \
+        for (int k = 0; k < ${const int: num}; k++) {                           \
+            wk[k] *= exp((emin * emin - ek[k] * ek[k]) * ${float: inv_sigma2}); \
+        }                                                                       \
+    @}                                                                          \
+    vec4 mc = vec4(0.0);                                                        \
+    vec2 mv = vec2(0.0);                                                        \
+    float sum = 0.0;                                                            \
+    for (int k = 0; k < ${const int: num}; k++) {                               \
+        mc += wk[k] * ck[k];                                                    \
+        mv += wk[k] * vk[k];                                                    \
+        sum += wk[k];                                                           \
+    }                                                                           \
+    @if (sharp) {                                                               \
+        if (sum > 1e-6) {                                                       \
+            mv /= sum;                                                          \
+            float var = 0.0;                                                    \
+            for (int k = 0; k < ${const int: num}; k++) {                       \
+                vec2 dv = vk[k] - mv;                                           \
+                var += wk[k] * dot(dv, dv);                                     \
+            }                                                                   \
+            float agree = exp(-var / sum * ${float: inv_sharp2});               \
+            if (agree > 0.004)                                                  \
+                mc = mix(mc, sum * lm_pair_sharp(pa, pb, mv, t), agree);        \
+        }                                                                       \
+    @}                                                                          \
+    float fb = ${float: lm->fallback}                                           \
+             * max(1.0 - sum / ${float: prior_max}, 0.0);                       \
+    color = mix(lm_sample_a(pa), lm_sample_b(pb), t);                           \
+    if (sum + fb > 1e-6)                                                        \
+        color = (mc + fb * color) / (sum + fb);                                 \
+    }
+    // clang-format on
+
+    return true;
+}
+
 bool pl_shader_frame_interp(pl_shader sh,
                             const struct pl_frame_interp_input *input,
                             const struct pl_frame_interp_params *params)
@@ -2247,6 +2528,10 @@ bool pl_shader_frame_interp(pl_shader sh,
         break;
     case PL_FRAME_INTERP_VISUALIZE:
         me_dir = PL_MOTION_FORWARD;
+        break;
+    case PL_FRAME_INTERP_LOCAL_MOTION:
+        me_dir = params->local.bidir ? PL_MOTION_BOTH : PL_MOTION_FORWARD;
+        me_global = params->local.global > 0.0f;
         break;
     case PL_FRAME_INTERP_ALGO_COUNT:
     default:
@@ -2278,6 +2563,8 @@ bool pl_shader_frame_interp(pl_shader sh,
         return frame_interp_global(sh, input, &out_color);
     case PL_FRAME_INTERP_VISUALIZE:
         return frame_interp_visualize(sh, input, &out_color);
+    case PL_FRAME_INTERP_LOCAL_MOTION:
+        return frame_interp_local(sh, input, params, &out_color);
     case PL_FRAME_INTERP_ALGO_COUNT:
         break;
     }

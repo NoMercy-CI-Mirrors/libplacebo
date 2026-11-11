@@ -231,8 +231,62 @@ enum pl_frame_interp_algo {
     // of the earlier frame and as opaque as the vectors are confident.
     PL_FRAME_INTERP_VISUALIZE,
 
+    // EXPERIMENTAL: compensates each pixel by the motion found around it,
+    // weighing the vectors by how well the two frames then agree, and falling
+    // back to plain frame mixing where no motion is known.
+    PL_FRAME_INTERP_LOCAL_MOTION,
+
     PL_FRAME_INTERP_ALGO_COUNT,
 };
+
+// EXPERIMENTAL: tunables of `PL_FRAME_INTERP_LOCAL_MOTION`. Subject to change
+// or removal without notice.
+struct pl_frame_interp_local_params {
+    // Also estimate and use the motion from the later frame to the earlier
+    // one. Doubles the cost of motion estimation.
+    bool bidir;
+
+    // Distance, in pixels of the flow fields, between the points around an
+    // output pixel that the flow fields are read at. The compensated samples
+    // of the four nearest points are blended, which keeps the motion from
+    // switching between neighbouring pixels. Values below 1 are treated as 1.
+    float pitch;
+
+    // A flow field holds the motion of what is at a position in its own
+    // frame, rather than of what will be there at the point in time being
+    // synthesized. This is the number of fixed point iterations spent on
+    // finding the latter. 0 reads the flow fields as they are.
+    int iterations;
+
+    // Confidence below which a vector is ignored, and above which it is fully
+    // trusted.
+    float conf_lo, conf_hi;
+
+    // Weight of the global motion as a candidate for every pixel, relative to
+    // that of all other vectors together. 0 disables this.
+    float global;
+
+    // Tolerated mismatch between the two frames, as a difference in the
+    // square root of their luma, when weighing candidates against the best
+    // matching one. 0 disables this, weighing candidates only by distance and
+    // confidence.
+    float sigma;
+
+    // Where the candidates' vectors agree to within this many pixels of the
+    // flow fields, both frames are resampled once along their mean with a
+    // bicubic filter, instead of mixing the candidates' bilinear samples. 0
+    // disables this.
+    float sharp;
+
+    // Weight of plain frame mixing, relative to the weight the candidates
+    // lack for want of confidence. 0 disables this.
+    float fallback;
+};
+
+#define PL_FRAME_INTERP_LOCAL_DEFAULTS                                         \
+    .bidir = true, .pitch = 4.0f, .iterations = 2, .conf_lo = 0.05f,           \
+    .conf_hi = 0.2f, .global = 0.02f, .sigma = 0.2f, .sharp = 1.0f,            \
+    .fallback = 0.05f,
 
 // Tunable parameters. Kept separate from the per-call inputs so that callers
 // can reuse unchanging configurations.
@@ -242,11 +296,15 @@ struct pl_frame_interp_params {
 
     // Motion estimation parameters.
     struct pl_motion_estimate_params motion;
+
+    // Parameters of `PL_FRAME_INTERP_LOCAL_MOTION`.
+    struct pl_frame_interp_local_params local;
 };
 
 #define PL_FRAME_INTERP_DEFAULTS                                               \
     .algo = PL_FRAME_INTERP_GLOBAL_MOTION,                                     \
-    .motion = {PL_MOTION_ESTIMATE_DEFAULTS},
+    .motion = {PL_MOTION_ESTIMATE_DEFAULTS},                                   \
+    .local = {PL_FRAME_INTERP_LOCAL_DEFAULTS},
 
 #define pl_frame_interp_params(...)                                            \
     (&(struct pl_frame_interp_params) {PL_FRAME_INTERP_DEFAULTS __VA_ARGS__})
