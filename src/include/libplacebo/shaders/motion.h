@@ -153,9 +153,8 @@ PL_API void pl_motion_reset(pl_shader_obj state);
 //  - The field's own dimensions are unspecified and should be sampled with
 //    normalized coordinates (motion estimate may be in block granularity).
 //
-// `tex->params` provides the exact dimensions and formats. `params.w` and
-// `params.h` are typically smaller than the source frame dimensions because
-// motion is estimated at a block granularity.
+// `tex->params` provides the exact dimensions and formats. The field holds a
+// vector for every pixel of the source frames.
 //
 // Each texel holds `vec3(mv.x, mv.y, confidence)` in its first three
 // components, in a floating point format. `mv.x` and `mv.y` may be

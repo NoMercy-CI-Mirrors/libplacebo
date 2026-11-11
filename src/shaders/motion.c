@@ -55,12 +55,15 @@ struct sh_motion_obj {
     // searched by the most recent motion estimation invocation. Used to seed
     // the next motion estimation search.
     //
-    // `fwd.elem[0]` and `bwd.elem[0]` are what `pl_motion_get_flow` would
-    // return.
+    // `dense_fwd` and `dense_bwd` are the per pixel refinements of
+    // `fwd.elem[0]` and `bwd.elem[0]`, at the input resolution, and what
+    // `pl_motion_get_flow` returns.
     // `valid` determines if `fwd` and `bwd` contain useful content.
     struct {
         tex_pyramid_t fwd;
         tex_pyramid_t bwd;
+        pl_tex dense_fwd;
+        pl_tex dense_bwd;
         enum pl_motion_direction valid; // directions actually computed
     } flow;
 
@@ -155,6 +158,15 @@ static void bind_buf(pl_shader sh, const char *name, pl_buf buf,
 // the temporal state.
 #define MOTION_BPGX 2
 #define MOTION_BPGY 5
+
+// Side length of the window of pixels that `motion_refine_pass` matches
+// around every pixel.
+#define MOTION_REFINE_WINDOW 3
+
+// Margin by which a vector of a neighbouring block must match a pixel better
+// than the vector of its own block for `motion_refine_pass` to take it, as a
+// mean squared error per pixel in 8 bit code values.
+#define MOTION_REFINE_MARGIN 1.0f
 
 // Total number of bins considered when creating the histogram of global
 // motion. NOTE: if the median motion is outside of [-`MOTION_GLOBAL_BINS/2`,
@@ -523,6 +535,19 @@ static bool flow_pyramid_recreate(pl_gpu gpu, void *alloc,
     return true;
 }
 
+// Allocate or resize `*tex` to hold a flow field of the input resolution.
+static bool dense_flow_recreate(pl_gpu gpu, pl_tex *tex, int w, int h,
+                                pl_fmt fmt)
+{
+    bool ok = pl_tex_recreate(gpu, tex, pl_tex_params(
+        .w = w, .h = h, .format = fmt, .sampleable = true, .storable = true,
+        .debug_tag = PL_DEBUG_TAG, ));
+
+    if (!ok)
+        PL_ERR(gpu, "pl_motion_estimate: failed creating %dx%d flow field!", w, h);
+    return ok;
+}
+
 // Downscale `src` by one pyramid level into `dst` using the Burt-Adelson REDUCE
 // filter, i.e. convolution with the separable binomial kernel with a weighting
 // of [1 4 6 4 1]/16. `dst` must measure exactly `src` halved in each dimension,
@@ -599,6 +624,8 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
     pyramid_destroy(gpu, &obj->scratch.filtered);
     pyramid_destroy(gpu, &obj->flow.fwd);
     pyramid_destroy(gpu, &obj->flow.bwd);
+    pl_tex_destroy(gpu, &obj->flow.dense_fwd);
+    pl_tex_destroy(gpu, &obj->flow.dense_bwd);
     pl_buf_destroy(gpu, &obj->global.fwd);
     pl_buf_destroy(gpu, &obj->global.bwd);
     pl_buf_destroy(gpu, &obj->global.hist);
@@ -654,9 +681,9 @@ pl_tex pl_motion_get_flow(pl_shader_obj state, enum pl_motion_direction dir)
 
     switch (dir) {
     case PL_MOTION_FORWARD:
-        return obj->flow.fwd.elem[0];
+        return obj->flow.dense_fwd;
     case PL_MOTION_BACKWARD:
-        return obj->flow.bwd.elem[0];
+        return obj->flow.dense_bwd;
     default:
         break;
     }
@@ -1412,6 +1439,122 @@ error:
     return false;
 }
 
+// Writes a vector for every pixel of `out`, which measures the full
+// resolution: the vector of the pixel's block in `flow`, or that of one of the
+// 8 neighbouring blocks if it matches the window of pixels around the pixel
+// better by more than `MOTION_REFINE_MARGIN`. This follows motion boundaries
+// within a block, which a single vector per block cannot.
+//
+// The confidence is that of the block whose vector was taken.
+static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
+                               pl_tex ref, pl_tex tgt, pl_tex flow, pl_tex out)
+{
+    const int w = out->params.w, h = out->params.h;
+    const int grid_w = flow->params.w, grid_h = flow->params.h;
+    const int win = MOTION_REFINE_WINDOW;
+    // Work groups cover at most one block, so they share the candidates
+    const int dim = PL_MIN(bs, 16), n = PL_DIV_UP(bs, dim);
+    // Squared differences over the windows of all pixels of the work group
+    const int tile = dim + win - 1;
+    const int per_thread = PL_DIV_UP(PL_SQUARE(tile), PL_SQUARE(dim));
+
+    pl_shader sh = pl_dispatch_begin(dispatch);
+    sh_describef(sh, "motion vector refinement (%dx%d)", w, h);
+    sh->output = PL_SHADER_SIG_NONE;
+
+    const size_t shmem = PL_SQUARE(tile) * sizeof(float);
+    if (!sh_try_compute(sh, dim, dim, false, shmem)) {
+        PL_ERR(gpu,
+               "pl_motion_estimate: cannot create motion vector refinement "
+               "shader, needs %dx%d threads per work group!", dim, dim);
+        goto error;
+    }
+
+    ident_t src = bind_tex(sh, "flow_in", flow);
+    ident_t dst = bind_img(sh, "flow_out", out);
+    ident_t ref_id = bind_tex(sh, "ref", ref);
+    // The vectors are fractional
+    ident_t tgt_pt, tgt_id = sh_bind(sh, tgt, PL_TEX_ADDRESS_CLAMP,
+                                     PL_TEX_SAMPLE_LINEAR, "tgt", NULL, NULL,
+                                     &tgt_pt);
+    if (!tgt_id)
+        goto error;
+
+    // SSD over the window, in units of the luma textures
+    const float margin =
+        MOTION_REFINE_MARGIN * PL_SQUARE(win) / (255.0f * 255.0f);
+
+    // clang-format off
+#pragma GLSLH /* motion_refine_pass */                                          \
+    shared float s_diff[${const int: tile * tile}];
+#pragma GLSL /* motion_refine_pass */                                           \
+    ivec2 size  = ivec2(${const int: w}, ${const int: h});                      \
+    ivec2 grid  = ivec2(${const int: grid_w}, ${const int: grid_h});            \
+    ivec2 local = ivec2(gl_LocalInvocationID.xy);                               \
+    ivec2 blk   = ivec2(gl_WorkGroupID.xy) / ${const int: n};                   \
+    ivec2 sub   = ivec2(gl_WorkGroupID.xy) % ${const int: n} * ${const int: dim}\
+                + local;                                                        \
+    ivec2 pos   = blk * ${const int: bs} + sub;                                 \
+                                                                                \
+    float r[${const int: per_thread}];                                          \
+    vec2 c[${const int: per_thread}];                                           \
+    for (int l = 0; l < ${const int: per_thread}; l++) {                        \
+        int j = int(gl_LocalInvocationIndex) + l * ${const int: dim * dim};     \
+        ivec2 q = clamp(pos - local + ivec2(j % ${const int: tile},             \
+                                            j / ${const int: tile})             \
+                        - ${const int: win / 2}, ivec2(0), size - 1);           \
+        r[l] = texelFetch($ref_id, q, 0).r;                                     \
+        c[l] = vec2(q) + vec2(0.5);                                             \
+    }                                                                           \
+                                                                                \
+    /* The block's own vector first, then those of its neighbours. */           \
+    vec3 cand[9];                                                               \
+    for (int k = 0; k < 9; k++) {                                               \
+        int i = k == 0 ? 4 : k <= 4 ? k - 1 : k;                                \
+        ivec2 p = clamp(blk + ivec2(i % 3, i / 3) - 1, ivec2(0), grid - 1);     \
+        cand[k] = texelFetch($src, p, 0).xyz;                                   \
+    }                                                                           \
+                                                                                \
+    vec3 best = cand[0];                                                        \
+    float best_ssd = 0.0;                                                       \
+    for (int k = 0; k < 9; k++) {                                               \
+        barrier();                                                              \
+        for (int l = 0; l < ${const int: per_thread}; l++) {                    \
+            int j = int(gl_LocalInvocationIndex) + l * ${const int: dim * dim}; \
+            vec2 pt = (c[l] + cand[k].xy) * $tgt_pt;                            \
+            float d = r[l] - textureLod($tgt_id, pt, 0.0).r;                    \
+            if (j < ${const int: tile * tile})                                  \
+                s_diff[j] = d * d;                                              \
+        }                                                                       \
+        barrier();                                                              \
+                                                                                \
+        float ssd = k == 0 ? 0.0 : ${float: margin};                            \
+        for (int j = 0; j < ${const int: win * win}; j++) {                     \
+            ssd += s_diff[(local.y + j / ${const int: win}) * ${const int: tile}\
+                          + local.x + j % ${const int: win}];                   \
+        }                                                                       \
+        if (k == 0 || ssd < best_ssd) {                                         \
+            best = cand[k];                                                     \
+            best_ssd = ssd;                                                     \
+        }                                                                       \
+    }                                                                           \
+                                                                                \
+    if (all(lessThan(sub, ivec2(${const int: bs}))) && all(lessThan(pos, size)))\
+        imageStore($dst, pos, vec4(best, 0.0));
+    // clang-format on
+
+    const struct pl_dispatch_compute_params *params = pl_dispatch_compute_params(
+        .shader        = &sh,
+        .dispatch_size = { grid_w * n, grid_h * n, 1 },
+    );
+
+    return pl_dispatch_compute(dispatch, params);
+
+error:
+    pl_dispatch_abort(dispatch, &sh);
+    return false;
+}
+
 // Two contiguous histograms describing the global motion in the frame.
 // One histogram for each component of the motion vector (x,y).
 static const struct pl_buffer_var global_hist_var = {
@@ -1717,13 +1860,15 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
     // in the `obj->flow.fwd` and `obj->flow.bwd`.
     if (input->direction & PL_MOTION_FORWARD) {
         if (!flow_pyramid_recreate(gpu, obj, &obj->flow.fwd, w, h, levels,
-                                   params->block_size, mv_fmt))
+                                   params->block_size, mv_fmt) ||
+            !dense_flow_recreate(gpu, &obj->flow.dense_fwd, w, h, mv_fmt))
             goto error;
     }
 
     if (input->direction & PL_MOTION_BACKWARD) {
         if (!flow_pyramid_recreate(gpu, obj, &obj->flow.bwd, w, h, levels,
-                                   params->block_size, mv_fmt))
+                                   params->block_size, mv_fmt) ||
+            !dense_flow_recreate(gpu, &obj->flow.dense_bwd, w, h, mv_fmt))
             goto error;
     }
 
@@ -1828,6 +1973,16 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
                 break;
         }
 
+        if (!ok)
+            break;
+
+        ok = motion_refine_pass(gpu, input->dispatch, params->block_size,
+                                fwd ? obj->pyramid_prev.elem[0]
+                                    : obj->scratch.levels.elem[0],
+                                fwd ? obj->scratch.levels.elem[0]
+                                    : obj->pyramid_prev.elem[0],
+                                obj->scratch.filtered.elem[0],
+                                fwd ? obj->flow.dense_fwd : obj->flow.dense_bwd);
         if (!ok)
             break;
 
