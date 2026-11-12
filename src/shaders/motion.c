@@ -778,6 +778,13 @@ bool pl_motion_debug_set_vsync(pl_shader_obj state, int w, int h,
 }
 
 
+// EXPERIMENT (stage B): tunables read from the environment
+static float b_envf(const char *name, float def)
+{
+    const char *v = getenv(name);
+    return v ? atof(v) : def;
+}
+
 static int dc_env(const char *name, int def)
 {
     const char *v = getenv(name);
@@ -1173,6 +1180,8 @@ static bool dc_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp,
         return false;
     const float tau = getenv("LM_SPLAT_TAU") ? atof(getenv("LM_SPLAT_TAU")) : 0.3f;
     const int spread = dc_env("LM_SPLAT_GSPREAD", 0); // gather variant (slow)
+    const int conf = dc_env("LM_D_CONF", 1);
+    const float conft = b_envf("LM_D_CONFT", 0.5f);
     for (int i = 0; i < 3; i++) {
         pl_buf *buf = i ? &obj->dc_key[i - 1] : &obj->dc_src;
         const size_t size = i ? n * 4 : n * 16;
@@ -1271,6 +1280,20 @@ static bool dc_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp,
             vec3 c1 = d == 0 ? textureLod($tbx, q, 0.0).rgb : textureLod($ta, q, 0.0).rgb;\
             bool hid = f.z < 0.5;                                               \
             float cost = hid ? 0.1 : abs(dot(c0 - c1, lw));                     \
+            @if (conf > 0) {                                                    \
+            if (hid) {                                                          \
+                /* hidden only if it lands on a visible pixel that moves */     \
+                /* differently; else the vector is merely unreliable */         \
+                ivec2 lq = ivec2(floor(vec2(p) + f.xy + 0.5));                  \
+                bool okq = all(greaterThanEqual(lq, ivec2(0))) && all(lessThan(lq, size));\
+                vec4 o = vec4(0.0);                                             \
+                if (okq)                                                        \
+                    o = d == 0 ? texelFetch($fb, lq, 0) : texelFetch($ff, lq, 0);\
+                bool confirmed = okq && o.z >= 0.5 && length(o.xy + f.xy) > ${const float: conft};\
+                if (${const int: conf} == 2) confirmed = confirmed || !okq;     \
+                if (!confirmed) { hid = false; cost = 1.0; }                    \
+            }                                                                   \
+            @}                                                                  \
             uint cq;                                                            \
             @if (tb == 0)                                                       \
                 cq = uint(min(cost * 1024.0, 255.0)) << 21;                     \
@@ -2365,13 +2388,6 @@ error:
     return false;
 }
 
-// EXPERIMENT (stage B): tunables read from the environment
-static float b_envf(const char *name, float def)
-{
-    const char *v = getenv(name);
-    return v ? atof(v) : def;
-}
-
 // Set by `pl_shader_frame_interp`: whether the estimation runs stage B's
 // occlusion and fill passes after the per pixel selection.
 static int motion_b_request;
@@ -2394,7 +2410,7 @@ static bool motion_occlusion_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
     ident_t opp_id = bind_tex_linear(sh, "flow_opp", opp);
     ident_t ref_id = bind_tex_linear(sh, "ref", ref);
     ident_t dst = bind_img(sh, "flow_out", out);
-    const float fbt = b_envf("LM_B_FBT", 1.0f), ot = b_envf("LM_B_OT", 0.3f);
+    const float fbt = b_envf("LM_B_FBT", 1.5f), ot = b_envf("LM_B_OT", 0.15f);
     const float noise = 9.0f / (255.0f * 255.0f);
 
     // clang-format off
@@ -2450,7 +2466,14 @@ static bool motion_fill_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     ident_t ref_id = bind_tex(sh, "ref", ref);
     ident_t dst = bind_img(sh, "flow_out", out);
     const float fsig = b_envf("LM_B_FSIG", 0.05f);
-    const int rings = dc_env("LM_B_RINGS", 7);
+    const int rings = dc_env("LM_B_RINGS", 9);
+    // 0: block candidates, ring samples; 2: + nearest visible pixel of each
+    // direction as candidates; 3: only those, as candidates and samples;
+    // 4: as 3, plus the block candidates
+    const int fmode = dc_env("LM_B_FMODE", 3);
+    const int nper = dc_env("LM_B_NPER", 1); // visible pixels taken per direction
+    const bool iso = dc_env("LM_B_ISO", 0);
+    const float isot = b_envf("LM_B_ISOT", 1.0f);
 
     // clang-format off
 #pragma GLSL /* motion_fill_pass */                                             \
@@ -2460,15 +2483,29 @@ static bool motion_fill_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     ivec2 pos  = ivec2(gl_GlobalInvocationID.xy);                               \
     if (all(lessThan(pos, size))) {                                             \
         vec4 f = texelFetch($src, pos, 0);                                      \
-        if (f.z < 0.5) {                                                        \
-            const int ax[7] = int[7](1, 2, 3, 5, 8, 12, 16);                    \
-            const int dg[7] = int[7](1, 1, 2, 4, 6, 8, 11);                     \
+        bool fill = f.z < 0.5;                                                  \
+        @if (iso) {                                                             \
+        if (!fill) {                                                            \
+            /* a vector none of the 8 neighbours shares */                      \
+            fill = true;                                                        \
+            for (int j = 0; j < 9 && fill; j++) {                               \
+                if (j == 4) continue;                                           \
+                ivec2 q = clamp(pos + ivec2(j % 3, j / 3) - 1, ivec2(0), size - 1);\
+                vec2 dv = texelFetch($src, q, 0).xy - f.xy;                     \
+                if (dot(dv, dv) <= ${const float: isot * isot}) fill = false;   \
+            }                                                                   \
+        }                                                                       \
+        @}                                                                      \
+        if (fill) {                                                             \
+            const int ax[9] = int[9](1, 2, 3, 5, 8, 12, 16, 24, 32);            \
+            const int dg[9] = int[9](1, 1, 2, 4, 6, 8, 11, 17, 23);             \
             const ivec2 dirs[8] = ivec2[8](ivec2(1, 0), ivec2(1, 1),            \
                 ivec2(0, 1), ivec2(-1, 1), ivec2(-1, 0), ivec2(-1, -1),         \
                 ivec2(0, -1), ivec2(1, -1));                                    \
-            vec2 cand[9];                                                       \
-            float score[9];                                                     \
-            for (int k = 0; k < 9; k++) {                                       \
+            vec2 cand[${const int: 9 + 8 * nper}];                              \
+            float score[${const int: 9 + 8 * nper}];                            \
+            int nc = ${const int: fmode == 3 ? 0 : 9};                          \
+            for (int k = 0; k < nc; k++) {                                      \
                 int i = k == 0 ? 4 : k <= 4 ? k - 1 : k;                        \
                 ivec2 b = clamp(pos / ${const int: bs} + ivec2(i % 3, i / 3) - 1,\
                                 ivec2(0), grid - 1);                            \
@@ -2476,6 +2513,38 @@ static bool motion_fill_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
                 score[k] = 0.0;                                                 \
             }                                                                   \
             float centre = texelFetch($ref_id, pos, 0).r;                       \
+            @if (fmode >= 2) {                                                  \
+            /* the nearest visible pixel in each direction */                   \
+            float cw[${const int: 8 * nper}];                                   \
+            int nb = nc;                                                        \
+            for (int a = 0; a < 8; a++) {                                       \
+                int got = 0;                                                    \
+                for (int r = 0; r < ${const int: rings}; r++) {                 \
+                    ivec2 o = dirs[a] * ((a & 1) == 1 ? dg[r] : ax[r]);         \
+                    ivec2 s = clamp(pos + o, ivec2(0), size - 1);               \
+                    vec4 n = texelFetch($src, s, 0);                            \
+                    if (n.z < 0.5)                                              \
+                        continue;                                               \
+                    float di = (texelFetch($ref_id, s, 0).r - centre)           \
+                             / ${const float: fsig};                            \
+                    cw[nc - nb] = exp(-di * di) / (1.0 + length(vec2(o)) / 4.0);\
+                    score[nc] = 0.0;                                            \
+                    cand[nc++] = n.xy;                                          \
+                    if (++got == ${const int: nper})                            \
+                        break;                                                  \
+                }                                                               \
+            }                                                                   \
+            @if (fmode == 3 || fmode == 4) {                                    \
+            for (int k = 0; k < nc; k++) {                                      \
+                for (int j = nb; j < nc; j++) {                                 \
+                    vec2 dv = cand[k] - cand[j];                                \
+                    if (dot(dv, dv) <= 1.0)                                     \
+                        score[k] += cw[j - nb];                                 \
+                }                                                               \
+            }                                                                   \
+            @}                                                                  \
+            @}                                                                  \
+            @if (fmode <= 2) {                                                  \
             for (int r = 0; r < ${const int: rings}; r++) {                     \
                 for (int a = 0; a < 8; a++) {                                   \
                     ivec2 o = dirs[a] * ((a & 1) == 1 ? dg[r] : ax[r]);         \
@@ -2486,19 +2555,20 @@ static bool motion_fill_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
                     float di = (texelFetch($ref_id, s, 0).r - centre)           \
                              / ${const float: fsig};                            \
                     float wgt = exp(-di * di) / (1.0 + length(vec2(o)) / 4.0);  \
-                    for (int k = 0; k < 9; k++) {                               \
+                    for (int k = 0; k < nc; k++) {                              \
                         vec2 dv = cand[k] - n.xy;                               \
                         if (dot(dv, dv) <= 1.0)                                 \
                             score[k] += wgt;                                    \
                     }                                                           \
                 }                                                               \
             }                                                                   \
+            @}                                                                  \
             int best = 0;                                                       \
-            for (int k = 1; k < 9; k++) {                                       \
+            for (int k = 1; k < nc; k++) {                                      \
                 if (score[k] > score[best])                                     \
                     best = k;                                                   \
             }                                                                   \
-            if (score[best] > 0.0)                                              \
+            if (nc > 0 && score[best] > 0.0)                                    \
                 f.xy = cand[best];                                              \
         }                                                                       \
         imageStore($dst, pos, f);                                               \
@@ -3393,6 +3463,9 @@ static bool frame_interp_local(pl_shader sh,
         const bool bilin = dc_env("LM_SPLAT_BILIN", 0);
         const bool dbg = dc_env("LM_SPLAT_DEBUG", 0);
         const int holechk = dc_env("LM_SPLAT_HOLECHK", 2);
+        const bool novis = dc_env("LM_C_NOVIS", 0);
+        const float csig = b_envf("LM_C_SIGMA", 0.0f);
+        const float softvis = b_envf("LM_C_SOFTVIS", 0.2f);
         // clang-format off
 #pragma GLSL /* EXPERIMENT splat C */                                           \
     vec4 color;                                                                 \
@@ -3464,6 +3537,8 @@ static bool frame_interp_local(pl_shader sh,
     }                                                                           \
     vec2 qa = pa + to_a * ${pt[0]};                                             \
     vec2 qb = pb + to_b * ${pt[1]};                                             \
+    @if (novis)                                                                 \
+        vis = vec2(1.0);                                                        \
     float wa = (1.0 - t) * vis.x * lm_inside(qa);                               \
     float wb = t * vis.y * lm_inside(qb);                                       \
     @if (dbg) {                                                                 \
@@ -3472,8 +3547,25 @@ static bool frame_interp_local(pl_shader sh,
     if (wa + wb > 0.0) {                                                        \
         @if (bilin)                                                             \
             color = (wa * lm_sample_a(qa) + wb * lm_sample_b(qb)) / (wa + wb);  \
-        @else                                                                   \
-            color = (wa * ${cubic_id[0]}(qa) + wb * ${cubic_id[1]}(qb)) / (wa + wb);\
+        @else {                                                                 \
+            vec4 ca = ${cubic_id[0]}(qa), cb = ${cubic_id[1]}(qb);              \
+            @if (softvis > 0.0) {                                               \
+            /* a side marked hidden still counts if it shows the same */        \
+            if (vis.x + vis.y == 1.0 && lm_inside(qa) * lm_inside(qb) > 0.0) {  \
+                float e = abs(lm_luma(ca) - lm_luma(cb)) / ${const float: softvis};\
+                vis = max(vis, vec2(exp(-e * e)));                              \
+                wa = (1.0 - t) * vis.x; wb = t * vis.y;                         \
+            }                                                                   \
+            @}                                                                  \
+            color = (wa * ca + wb * cb) / (wa + wb);                            \
+            @if (csig > 0.0) {                                                  \
+            if (wa > 0.0 && wb > 0.0) {                                         \
+                float err = abs(lm_luma(ca) - lm_luma(cb)) / ${const float: csig};\
+                vec4 plain = mix(lm_sample_a(pa), lm_sample_b(pb), t);          \
+                color = mix(plain, color, exp(-err * err));                     \
+            }                                                                   \
+            @}                                                                  \
+        @}                                                                      \
     } else {                                                                    \
         color = mix(lm_sample_a(pa), lm_sample_b(pb), t);                       \
     }                                                                           \
