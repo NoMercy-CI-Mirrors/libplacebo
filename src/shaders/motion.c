@@ -68,6 +68,25 @@ struct sh_motion_obj {
         enum pl_motion_direction valid; // directions actually computed
     } flow;
 
+    // EXPERIMENT: per-vsync field injected by pl_motion_debug_set_vsync
+    pl_tex dbg_vsync[2];
+    pl_buf dbg_splat;
+
+    // EXPERIMENT (LM_SPLAT): stage D. `dc_src` holds per pixel and direction
+    // (packHalf2x16(vector), key prefix), rebuilt when `dc_dirty`. `dc_key`
+    // are the ping-ponged per-vsync key buffers, `dc_frame` counts splats.
+    pl_buf dc_src, dc_key[2];
+    bool dc_dirty;
+    unsigned dc_frame;
+    pl_tex dc_depth[2]; // unused
+    // derived depth (LM_SPLAT_DEPTH=1): union-find labels over both grids,
+    // compact component ids, vote hash table, ranks (+ id counter)
+    pl_buf dc_lab, dc_cid, dc_hash, dc_rank;
+    bool dc_have_depth;
+    // LM_SPLAT_DEPTH=2: "in front" stamps (= dc_pair where set), no clearing
+    pl_buf dc_mark;
+    unsigned dc_pair;
+
     // Dimensions of `flow.fwd.elem[0]` (number of blocks to cover the full
     // resolution).
     int grid_w, grid_h;
@@ -550,6 +569,7 @@ static bool dense_flow_recreate(pl_gpu gpu, pl_tex *tex, int w, int h,
 {
     bool ok = pl_tex_recreate(gpu, tex, pl_tex_params(
         .w = w, .h = h, .format = fmt, .sampleable = true, .storable = true,
+        .host_writable = true, .host_readable = true, // EXPERIMENT
         .debug_tag = PL_DEBUG_TAG, ));
 
     if (!ok)
@@ -635,6 +655,19 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
     pyramid_destroy(gpu, &obj->flow.bwd);
     pl_tex_destroy(gpu, &obj->flow.dense_fwd);
     pl_tex_destroy(gpu, &obj->flow.dense_bwd);
+    pl_tex_destroy(gpu, &obj->dbg_vsync[0]);
+    pl_tex_destroy(gpu, &obj->dbg_vsync[1]);
+    pl_buf_destroy(gpu, &obj->dbg_splat);
+    pl_buf_destroy(gpu, &obj->dc_src);
+    pl_buf_destroy(gpu, &obj->dc_lab);
+    pl_buf_destroy(gpu, &obj->dc_mark);
+    pl_buf_destroy(gpu, &obj->dc_cid);
+    pl_buf_destroy(gpu, &obj->dc_hash);
+    pl_buf_destroy(gpu, &obj->dc_rank);
+    pl_buf_destroy(gpu, &obj->dc_key[0]);
+    pl_buf_destroy(gpu, &obj->dc_key[1]);
+    pl_tex_destroy(gpu, &obj->dc_depth[0]);
+    pl_tex_destroy(gpu, &obj->dc_depth[1]);
     pl_buf_destroy(gpu, &obj->global.fwd);
     pl_buf_destroy(gpu, &obj->global.bwd);
     pl_buf_destroy(gpu, &obj->global.hist);
@@ -699,6 +732,734 @@ pl_tex pl_motion_get_flow(pl_shader_obj state, enum pl_motion_direction dir)
 
     return NULL; // `dir` cannot name `PL_MOTION_BOTH`, we can only return
                  // one flow field.
+}
+
+bool pl_motion_debug_set_flow(pl_shader_obj state, enum pl_motion_direction dir,
+                              const void *data)
+{
+    pl_tex tex = pl_motion_get_flow(state, dir);
+    if (!tex)
+        return false;
+    struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
+                                              struct sh_motion_obj);
+    obj->dc_dirty = true;
+    return pl_tex_upload(state->gpu, pl_tex_transfer_params(.tex = tex, .ptr = (void *) data));
+}
+
+bool pl_motion_debug_set_vsync(pl_shader_obj state, int w, int h,
+                               const void *to_ab, const void *vis)
+{
+    struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
+                                              struct sh_motion_obj);
+    if (!obj)
+        return false;
+    pl_gpu gpu = state->gpu;
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16, PL_FMT_CAP_SAMPLEABLE);
+    const void *data[2] = { to_ab, vis };
+    for (int i = 0; i < 2; i++) {
+        if (!pl_tex_recreate(gpu, &obj->dbg_vsync[i], pl_tex_params(
+                .w = w, .h = h, .format = fmt, .sampleable = true,
+                .host_writable = true)))
+            return false;
+        if (!pl_tex_upload(gpu, pl_tex_transfer_params(.tex = obj->dbg_vsync[i],
+                                                       .ptr = (void *) data[i])))
+            return false;
+    }
+    return true;
+}
+
+
+static int dc_env(const char *name, int def)
+{
+    const char *v = getenv(name);
+    return v ? atoi(v) : def;
+}
+
+static struct pl_buffer_var dc_var(const char *name, int dim_v, size_t n)
+{
+    return (struct pl_buffer_var) {
+        .var = { .name = name, .type = PL_VAR_UINT, .dim_v = dim_v, .dim_m = 1,
+                 .dim_a = n },
+        .layout = { .offset = 0, .stride = 4 * dim_v, .size = n * 4 * dim_v },
+    };
+}
+
+static ident_t bind_tex_linear(pl_shader sh, const char *name, pl_tex tex)
+{
+    return sh_desc(sh, (struct pl_shader_desc) {
+        .desc = { .name = name, .type = PL_DESC_SAMPLED_TEX },
+        .binding = { .object = tex, .sample_mode = PL_TEX_SAMPLE_LINEAR,
+                     .address_mode = PL_TEX_ADDRESS_CLAMP },
+    });
+}
+
+
+#define DC_HS 16384     // vote hash slots (power of two)
+#define DC_MAXC 65535   // component ids (16 bits each in a vote key)
+
+// EXPERIMENT: depth from the flow fields' vectors and hidden flags alone.
+// Both grids are split into components of 4-neighbours whose vectors differ by
+// less than LM_SPLAT_TAU px, linked across the pair where a visible pixel lands
+// on one moving back to it. A hidden pixel votes for the component at its
+// landing spot being in front of its own. Rank = longest path over edges with
+// >= LM_SPLAT_MINV votes and a 2:1 majority, up to 3.
+static bool dc_derive_depth(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
+{
+    const int w = obj->flow.dense_fwd->params.w, h = obj->flow.dense_fwd->params.h;
+    const size_t n = (size_t) w * h;
+    const float tau = getenv("LM_SPLAT_TAU") ? atof(getenv("LM_SPLAT_TAU")) : 0.3f;
+    const int minv = dc_env("LM_SPLAT_MINV", 8);
+    const int xmode = dc_env("LM_SPLAT_XLINK", 2); // 0 none, 1 all, 2 sparse
+    const int th = PL_DIV_UP(h, 16); // tile rows per grid; grids are tile aligned
+    struct { pl_buf *buf; size_t size; } bufs[] = {
+        { &obj->dc_lab, 2 * n * 4 }, { &obj->dc_cid, 2 * n * 4 },
+        { &obj->dc_hash, DC_HS * 12 + 4 }, { &obj->dc_rank, (DC_MAXC + 1) * 4 },
+    };
+    for (int i = 0; i < PL_ARRAY_SIZE(bufs); i++) {
+        if (*bufs[i].buf && (*bufs[i].buf)->params.size >= bufs[i].size)
+            continue;
+        pl_buf_destroy(gpu, bufs[i].buf);
+        *bufs[i].buf = pl_buf_create(gpu, pl_buf_params(.size = bufs[i].size, .storable = true));
+        if (!*bufs[i].buf)
+            return false;
+    }
+
+    static const char *names[] = {
+        "depth: init", "depth: tile components", "depth: merge components",
+        "depth: compress labels", "depth: mark voting components",
+        "depth: number components", "depth: votes", "depth: rank",
+    };
+    for (int pass = 0; pass < 8; pass++) {
+        pl_shader sh = pl_dispatch_begin(dp);
+        sh->output = PL_SHADER_SIG_NONE;
+        sh_describe(sh, names[pass]);
+        const bool one = pass == 7;
+        if (!sh_try_compute(sh, one ? 256 : 16, one ? 1 : 16, false, pass == 1 ? 1024 : 0)) {
+            pl_dispatch_abort(dp, &sh);
+            return false;
+        }
+        struct pl_buffer_var vl = dc_var("dc_lab", 1, 2 * n), vc = dc_var("dc_cid", 1, 2 * n);
+        struct pl_buffer_var vh = dc_var("dc_hash", 1, 3 * DC_HS + 1), vr = dc_var("dc_rank", 1, DC_MAXC + 1);
+        bind_buf(sh, "dc_lab_buf", obj->dc_lab, PL_DESC_ACCESS_READWRITE, &vl, 1);
+        bind_buf(sh, "dc_cid_buf", obj->dc_cid, PL_DESC_ACCESS_READWRITE, &vc, 1);
+        bind_buf(sh, "dc_hash_buf", obj->dc_hash, PL_DESC_ACCESS_READWRITE, &vh, 1);
+        bind_buf(sh, "dc_rank_buf", obj->dc_rank, PL_DESC_ACCESS_READWRITE, &vr, 1);
+        ident_t ff = bind_tex(sh, "dc_fwd", obj->flow.dense_fwd);
+        ident_t fb = bind_tex(sh, "dc_bwd", obj->flow.dense_bwd);
+        // clang-format off
+#pragma GLSLH /* EXPERIMENT depth */                                            \
+    const uint DC_NONE = 0xFFFFFFFFu, DC_MARK = 0xFFFFFFFEu;                    \
+    uint dc_find(uint x) {                                                      \
+        /* path halving: x is no root, so any ancestor is a valid parent */     \
+        uint y = dc_lab[x];                                                     \
+        while (y != x) {                                                        \
+            uint z = dc_lab[y];                                                 \
+            if (z != y)                                                         \
+                atomicMin(dc_lab[x], z);                                        \
+            x = z; y = dc_lab[x];                                               \
+        }                                                                       \
+        return x;                                                               \
+    }                                                                           \
+    void dc_unite(uint a, uint b) {                                             \
+        for (int it = 0; it < 64; it++) {                                       \
+            a = dc_find(a); b = dc_find(b);                                     \
+            if (a == b)                                                         \
+                return;                                                         \
+            if (a < b) { uint c = a; a = b; b = c; }                            \
+            uint old = atomicMin(dc_lab[a], b);                                 \
+            if (old == a)                                                       \
+                return;                                                         \
+            a = old;                                                            \
+        }                                                                       \
+    }                                                                           \
+    uint dc_slot(uint key) { return (key * 2654435761u) >> ${const int: 32 - 14}; }\
+    uint dc_lookup(uint key) {                                                  \
+        uint h = dc_slot(key);                                                  \
+        for (uint k = 0u; k < 64u; k++) {                                       \
+            uint s = (h + k) & ${const uint: DC_HS - 1};                        \
+            uint e = dc_hash[2u * s];                                           \
+            if (e == key) return dc_hash[2u * s + 1u] & 0x7FFFFFFFu;            \
+            if (e == DC_NONE) return 0u;                                        \
+        }                                                                       \
+        return 0u;                                                              \
+    }
+        // clang-format on
+        if (pass == 1) {
+            // clang-format off
+#pragma GLSLH /* EXPERIMENT depth: tile-local union-find */                     \
+    shared uint dc_sl[256];                                                     \
+    uint dc_sfind(uint x) {                                                     \
+        uint y = dc_sl[x];                                                      \
+        while (y != x) { x = y; y = dc_sl[x]; }                                 \
+        return x;                                                               \
+    }                                                                           \
+    void dc_sunite(uint a, uint b) {                                            \
+        for (int it = 0; it < 256; it++) {                                      \
+            a = dc_sfind(a); b = dc_sfind(b);                                   \
+            if (a == b)                                                         \
+                return;                                                         \
+            if (a < b) { uint c = a; a = b; b = c; }                            \
+            uint old = atomicMin(dc_sl[a], b);                                  \
+            if (old == a)                                                       \
+                return;                                                         \
+            a = old;                                                            \
+        }                                                                       \
+    }
+            // clang-format on
+        }
+        // clang-format off
+#pragma GLSL /* EXPERIMENT depth */                                             \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    uint N = uint(size.x * size.y);                                             \
+    float tau = ${const float: tau};                                            \
+    @if (pass == 7) {                                                           \
+        uint tid = gl_LocalInvocationIndex;                                     \
+        uint nl = min(dc_hash[${const uint: 2 * DC_HS}], ${const uint: DC_HS});  \
+        for (uint l = tid; l < nl; l += 256u) {                                 \
+            uint s = dc_hash[${const uint: 2 * DC_HS + 1} + l];                 \
+            uint key = dc_hash[2u * s], cnt = dc_hash[2u * s + 1u];             \
+            if (key != DC_NONE && cnt >= ${const uint: minv}) {                 \
+                uint rc = dc_lookup((key << 16) | (key >> 16));                 \
+                if (cnt > 2u * rc)                                              \
+                    atomicOr(dc_hash[2u * s + 1u], 0x80000000u);                \
+            }                                                                   \
+        }                                                                       \
+        memoryBarrierBuffer(); barrier();                                       \
+        for (int r = 0; r < 4; r++) {                                           \
+            for (uint l = tid; l < nl; l += 256u) {                             \
+                uint s = dc_hash[${const uint: 2 * DC_HS + 1} + l];             \
+                uint key = dc_hash[2u * s];                                     \
+                if (key != DC_NONE && (dc_hash[2u * s + 1u] & 0x80000000u) != 0u)\
+                    atomicMax(dc_rank[key >> 16], min(dc_rank[key & 0xFFFFu] + 1u, 3u));\
+            }                                                                   \
+            memoryBarrierBuffer(); barrier();                                   \
+        }                                                                       \
+    @} else {                                                                   \
+    ivec2 g2 = ivec2(gl_GlobalInvocationID.xy);                                 \
+    int g = g2.y >= ${const int: 16 * th} ? 1 : 0;                              \
+    ivec2 p = ivec2(g2.x, g2.y - g * ${const int: 16 * th});                    \
+    bool valid = all(lessThan(p, size));                                        \
+    uint i = uint(g) * N + uint(p.y * size.x + p.x);                            \
+    vec4 f = vec4(0.0);                                                         \
+    if (valid)                                                                  \
+        f = g == 0 ? texelFetch($ff, p, 0) : texelFetch($fb, p, 0);             \
+    @if (pass == 1) {                                                           \
+        uvec2 lid = gl_LocalInvocationID.xy;                                    \
+        uint li = lid.y * 16u + lid.x;                                          \
+        dc_sl[li] = li;                                                         \
+        barrier();                                                              \
+        if (valid) {                                                            \
+            if (lid.x < 15u && p.x + 1 < size.x) {                              \
+                vec2 fn = g == 0 ? texelFetch($ff, p + ivec2(1, 0), 0).xy       \
+                                 : texelFetch($fb, p + ivec2(1, 0), 0).xy;      \
+                if (length(fn - f.xy) < tau) dc_sunite(li, li + 1u);            \
+            }                                                                   \
+            if (lid.y < 15u && p.y + 1 < size.y) {                              \
+                vec2 fn = g == 0 ? texelFetch($ff, p + ivec2(0, 1), 0).xy       \
+                                 : texelFetch($fb, p + ivec2(0, 1), 0).xy;      \
+                if (length(fn - f.xy) < tau) dc_sunite(li, li + 16u);           \
+            }                                                                   \
+        }                                                                       \
+        barrier();                                                              \
+        uint r = dc_sfind(li);                                                  \
+        ivec2 rp = p - ivec2(lid) + ivec2(r % 16u, r / 16u);                    \
+        if (valid)                                                              \
+            dc_lab[i] = uint(g) * N + uint(rp.y * size.x + rp.x);               \
+    @}                                                                          \
+    if (valid) {                                                                \
+    @if (pass == 0) {                                                           \
+        dc_cid[i] = DC_NONE;                                                    \
+        if (i <= ${const uint: 2 * DC_HS})                                      \
+            dc_hash[i] = (i & 1u) == 0u && i < ${const uint: 2 * DC_HS} ? DC_NONE : 0u;\
+        if (i <= ${const uint: DC_MAXC})                                        \
+            dc_rank[i] = 0u;                                                    \
+    @}                                                                          \
+    @if (pass == 3)                                                             \
+        dc_lab[i] = dc_find(i);                                                 \
+    @if (pass == 5) {                                                           \
+        if (dc_cid[i] == DC_MARK) {                                             \
+            uint id = atomicAdd(dc_rank[${const uint: DC_MAXC}], 1u);           \
+            dc_cid[i] = id < ${const uint: DC_MAXC} ? id : DC_NONE;             \
+        }                                                                       \
+    @}                                                                          \
+    @if (pass == 2 || pass == 4 || pass == 6) {                                 \
+        ivec2 q = ivec2(floor(vec2(p) + f.xy + 0.5));                           \
+        bool in_frame = all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, size));\
+        uint j = uint(1 - g) * N + uint(q.y * size.x + q.x);                    \
+        @if (pass == 2) {                                                       \
+            if (p.x % 16 == 15 && p.x + 1 < size.x) {                           \
+                vec2 fn = g == 0 ? texelFetch($ff, p + ivec2(1, 0), 0).xy       \
+                                 : texelFetch($fb, p + ivec2(1, 0), 0).xy;      \
+                if (length(fn - f.xy) < tau) dc_unite(i, i + 1u);               \
+            }                                                                   \
+            if (p.y % 16 == 15 && p.y + 1 < size.y) {                           \
+                vec2 fn = g == 0 ? texelFetch($ff, p + ivec2(0, 1), 0).xy       \
+                                 : texelFetch($fb, p + ivec2(0, 1), 0).xy;      \
+                if (length(fn - f.xy) < tau) dc_unite(i, i + uint(size.x));     \
+            }                                                                   \
+            /* every tile component's root links; others sparsely */            \
+            if (f.z >= 0.5 && in_frame && ${const int: xmode} != 0 &&           \
+                (${const int: xmode} == 1 || dc_lab[i] == i ||                  \
+                 (p.x % 4 == 0 && p.y % 4 == 0))) {                             \
+                vec2 back = g == 0 ? texelFetch($fb, q, 0).xy : texelFetch($ff, q, 0).xy;\
+                if (length(back + f.xy) < 2.0 * tau + 0.5) dc_unite(i, j);      \
+            }                                                                   \
+        @}                                                                      \
+        @if (pass == 4) {                                                       \
+            if (f.z < 0.5 && in_frame) {                                        \
+                dc_cid[dc_lab[i]] = DC_MARK;                                    \
+                dc_cid[dc_lab[j]] = DC_MARK;                                    \
+            }                                                                   \
+        @}                                                                      \
+        @if (pass == 6) {                                                       \
+            if (f.z < 0.5 && in_frame) {                                        \
+                uint cv = dc_cid[dc_lab[i]], co = dc_cid[dc_lab[j]];            \
+                if (cv < ${const uint: DC_MAXC} && co < ${const uint: DC_MAXC} && cv != co) {\
+                    uint key = (co << 16) | cv, hs = dc_slot(key);              \
+                    for (uint k = 0u; k < 64u; k++) {                           \
+                        uint s = (hs + k) & ${const uint: DC_HS - 1};           \
+                        uint prev = atomicCompSwap(dc_hash[2u * s], DC_NONE, key);\
+                        if (prev == DC_NONE) {                                  \
+                            uint l = atomicAdd(dc_hash[${const uint: 2 * DC_HS}], 1u);\
+                            dc_hash[${const uint: 2 * DC_HS + 1} + l] = s;      \
+                        }                                                       \
+                        if (prev == DC_NONE || prev == key) {                   \
+                            atomicAdd(dc_hash[2u * s + 1u], 1u);                \
+                            break;                                              \
+                        }                                                       \
+                    }                                                           \
+                }                                                               \
+            }                                                                   \
+        @}                                                                      \
+    @}                                                                          \
+    }                                                                           \
+    @}
+        // clang-format on
+        if (!pl_dispatch_compute(dp, pl_dispatch_compute_params(
+                .shader = &sh,
+                .dispatch_size = { one ? 1 : PL_DIV_UP(w, 16), one ? 1 : 2 * th, 1 })))
+            return false;
+    }
+    obj->dc_have_depth = true;
+    return true;
+}
+
+
+// EXPERIMENT: 1-bit layer order. A hidden pixel stamps the pixel covering it
+// in the other frame, and that pixel's counterpart in its own frame.
+static bool dc_mark_front(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
+{
+    const int w = obj->flow.dense_fwd->params.w, h = obj->flow.dense_fwd->params.h;
+    const size_t n = (size_t) w * h;
+    if (!obj->dc_mark || obj->dc_mark->params.size < 2 * n * 4) {
+        pl_buf_destroy(gpu, &obj->dc_mark);
+        obj->dc_mark = pl_buf_create(gpu, pl_buf_params(.size = 2 * n * 4, .storable = true));
+        if (!obj->dc_mark)
+            return false;
+        obj->dc_pair = 0;
+        // zero once: stamps start at 1
+        pl_shader sh = pl_dispatch_begin(dp);
+        sh->output = PL_SHADER_SIG_NONE;
+        sh_describe(sh, "front mark init");
+        if (!sh_try_compute(sh, 16, 16, false, 0)) {
+            pl_dispatch_abort(dp, &sh);
+            return false;
+        }
+        struct pl_buffer_var vm = dc_var("dc_mark", 1, 2 * n);
+        bind_buf(sh, "dc_mark_buf", obj->dc_mark, PL_DESC_ACCESS_WRITEONLY, &vm, 1);
+        GLSL("ivec2 g2 = ivec2(gl_GlobalInvocationID.xy);                         \n"
+             "if (g2.x < %d && g2.y < %d) dc_mark[g2.y * %d + g2.x] = 0u;          \n",
+             w, 2 * h, w);
+        if (!pl_dispatch_compute(dp, pl_dispatch_compute_params(
+                .shader = &sh, .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(2 * h, 16), 1 })))
+            return false;
+    }
+    const unsigned stamp = ++obj->dc_pair;
+    pl_shader sh = pl_dispatch_begin(dp);
+    sh->output = PL_SHADER_SIG_NONE;
+    sh_describe(sh, "front mark (per pair)");
+    if (!sh_try_compute(sh, 16, 16, false, 0)) {
+        pl_dispatch_abort(dp, &sh);
+        return false;
+    }
+    struct pl_buffer_var vm = dc_var("dc_mark", 1, 2 * n);
+    bind_buf(sh, "dc_mark_buf", obj->dc_mark, PL_DESC_ACCESS_WRITEONLY, &vm, 1);
+    ident_t ff = bind_tex(sh, "dc_fwd", obj->flow.dense_fwd);
+    ident_t fb = bind_tex(sh, "dc_bwd", obj->flow.dense_bwd);
+    const int spread = dc_env("LM_SPLAT_SPREAD", 0);
+    const float tau = getenv("LM_SPLAT_TAU") ? atof(getenv("LM_SPLAT_TAU")) : 0.3f;
+    // clang-format off
+#pragma GLSLH /* EXPERIMENT front mark */                                       \
+    /* stamp p and the neighbours within `spread` moving with it */             \
+    void dc_stamp(int g, ivec2 p, vec2 v, uint st) {                            \
+        ivec2 size = ivec2(${const int: w}, ${const int: h});                   \
+        uint base = uint(g * size.x * size.y);                                  \
+        const int R = ${const int: spread};                                     \
+        for (int dy = -R; dy <= R; dy++) {                                      \
+            for (int dx = -R; dx <= R; dx++) {                                  \
+                ivec2 np = p + ivec2(dx, dy);                                   \
+                if (any(lessThan(np, ivec2(0))) || any(greaterThanEqual(np, size)))\
+                    continue;                                                   \
+                if (dx != 0 || dy != 0) {                                       \
+                    vec2 nv = g == 0 ? texelFetch($ff, np, 0).xy : texelFetch($fb, np, 0).xy;\
+                    if (length(nv - v) >= ${const float: tau})                  \
+                        continue;                                               \
+                }                                                               \
+                dc_mark[base + uint(np.y * size.x + np.x)] = st;                \
+            }                                                                   \
+        }                                                                       \
+    }
+    // clang-format on
+    // clang-format off
+#pragma GLSL /* EXPERIMENT front mark */                                        \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 g2 = ivec2(gl_GlobalInvocationID.xy);                                 \
+    int g = g2.y >= size.y ? 1 : 0;                                             \
+    ivec2 p = ivec2(g2.x, g2.y - g * size.y);                                   \
+    if (g2.x < size.x && g2.y < 2 * size.y) {                                   \
+        vec4 f = g == 0 ? texelFetch($ff, p, 0) : texelFetch($fb, p, 0);        \
+        ivec2 q = ivec2(floor(vec2(p) + f.xy + 0.5));                           \
+        if (f.z < 0.5 && all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, size))) {\
+            uint N = uint(size.x * size.y), st = ${uint: stamp};               \
+            vec2 o = g == 0 ? texelFetch($fb, q, 0).xy : texelFetch($ff, q, 0).xy;\
+            /* the occluder must not move back here, and its counterpart */     \
+            /* in this frame must move with it (no edge slivers) */             \
+            if (length(o + f.xy) > 0.5) {                                       \
+                dc_stamp(1 - g, q, o, st);                                      \
+                ivec2 r = ivec2(floor(vec2(q) + o + 0.5));                      \
+                if (all(greaterThanEqual(r, ivec2(0))) && all(lessThan(r, size))) {\
+                    vec2 fr = g == 0 ? texelFetch($ff, r, 0).xy : texelFetch($fb, r, 0).xy;\
+                    if (length(fr + o) < 0.5)                                   \
+                        dc_stamp(g, r, fr, st);                                 \
+                }                                                               \
+            }                                                                   \
+        }                                                                       \
+    }
+    // clang-format on
+    return pl_dispatch_compute(dp, pl_dispatch_compute_params(
+        .shader = &sh, .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(2 * h, 16), 1 }));
+}
+
+// EXPERIMENT: stage D, per pair: pack the vector and the precomputed part of
+// the splat key of both directions into `dc_src`.
+//
+// Key (atomicMin, front first), bits:
+//   31-30  3 - depth (layers beneath, clamped to 3)
+//   29     hidden in the other frame
+//   28-21  tiebreak: LM_SPLAT_TB=0 photometric cost, 1 distance of the
+//          splatted position to the target pixel centre, 2 both (4 bits each)
+//   20     direction (0 = from a along fwd, 1 = from b along bwd)
+//   19-0   source - target offset, 10 bits per axis, +512
+static bool dc_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp,
+                       pl_tex a, pl_tex b)
+{
+    const int w = obj->flow.dense_fwd->params.w, h = obj->flow.dense_fwd->params.h;
+    const size_t n = (size_t) w * h;
+    const int tb = dc_env("LM_SPLAT_TB", 0);
+    const int dmode = dc_env("LM_SPLAT_DEPTH", 0); // 0 flow.w, 1 rank, 2 mark, 3 gather
+    const bool own_depth = dmode == 1;
+    if (own_depth && !dc_derive_depth(obj, gpu, dp))
+        return false;
+    if (dmode == 2 && !dc_mark_front(obj, gpu, dp))
+        return false;
+    const float tau = getenv("LM_SPLAT_TAU") ? atof(getenv("LM_SPLAT_TAU")) : 0.3f;
+    const int spread = dc_env("LM_SPLAT_GSPREAD", 0); // gather variant (slow)
+    for (int i = 0; i < 3; i++) {
+        pl_buf *buf = i ? &obj->dc_key[i - 1] : &obj->dc_src;
+        const size_t size = i ? n * 4 : n * 16;
+        if (*buf && (*buf)->params.size >= size)
+            continue;
+        pl_buf_destroy(gpu, buf);
+        *buf = pl_buf_create(gpu, pl_buf_params(.size = size, .storable = true));
+        if (!*buf)
+            return false;
+        if (i)
+            obj->dc_frame = 0; // the clear pass below runs again
+    }
+
+    const int dim = 16;
+    for (int pass = obj->dc_frame ? 1 : 0; pass < 2; pass++) {
+        pl_shader sh = pl_dispatch_begin(dp);
+        sh->output = PL_SHADER_SIG_NONE;
+        sh_describe(sh, pass ? "splat prepare (per pair)" : "splat init");
+        if (!sh_try_compute(sh, dim, dim, false, 0)) {
+            pl_dispatch_abort(dp, &sh);
+            return false;
+        }
+        ident_t ff = NULL_IDENT, fb = NULL_IDENT, ta = NULL_IDENT, tbx = NULL_IDENT;
+        if (pass == 0) {
+            struct pl_buffer_var v0 = dc_var("dc_key0", 1, n), v1 = dc_var("dc_key1", 1, n);
+            bind_buf(sh, "dc_key0_buf", obj->dc_key[0], PL_DESC_ACCESS_WRITEONLY, &v0, 1);
+            bind_buf(sh, "dc_key1_buf", obj->dc_key[1], PL_DESC_ACCESS_WRITEONLY, &v1, 1);
+        } else {
+            struct pl_buffer_var vs = dc_var("dc_src", 2, 2 * n);
+            bind_buf(sh, "dc_src_buf", obj->dc_src, PL_DESC_ACCESS_WRITEONLY, &vs, 1);
+            ff = bind_tex(sh, "dc_fwd", obj->flow.dense_fwd);
+            fb = bind_tex(sh, "dc_bwd", obj->flow.dense_bwd);
+            ta = bind_tex_linear(sh, "dc_a", a);
+            tbx = bind_tex_linear(sh, "dc_b", b);
+            if (own_depth) {
+                struct pl_buffer_var vl = dc_var("dc_lab", 1, 2 * n), vc = dc_var("dc_cid", 1, 2 * n);
+                struct pl_buffer_var vr = dc_var("dc_rank", 1, DC_MAXC + 1);
+                bind_buf(sh, "dc_lab_buf", obj->dc_lab, PL_DESC_ACCESS_READONLY, &vl, 1);
+                bind_buf(sh, "dc_cid_buf", obj->dc_cid, PL_DESC_ACCESS_READONLY, &vc, 1);
+                bind_buf(sh, "dc_rank_buf", obj->dc_rank, PL_DESC_ACCESS_READONLY, &vr, 1);
+            }
+            if (dmode == 2) {
+                struct pl_buffer_var vm = dc_var("dc_mark", 1, 2 * n);
+                bind_buf(sh, "dc_mark_buf", obj->dc_mark, PL_DESC_ACCESS_READONLY, &vm, 1);
+            }
+        }
+        // clang-format off
+#pragma GLSL /* EXPERIMENT splat prepare */                                     \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);                                  \
+    if (all(lessThan(p, size))) {                                               \
+    int idx = p.y * size.x + p.x;                                               \
+    @if (pass == 0) {                                                           \
+        dc_key0[idx] = 0xFFFFFFFFu;                                             \
+        dc_key1[idx] = 0xFFFFFFFFu;                                             \
+    @} else {                                                                   \
+        vec2 isz = 1.0 / vec2(size);                                            \
+        const vec3 lw = vec3(0.2126, 0.7152, 0.0722);                           \
+        for (int d = 0; d < 2; d++) {                                           \
+            vec4 f = d == 0 ? texelFetch($ff, p, 0) : texelFetch($fb, p, 0);    \
+            float dep = ${const int: dmode} == 0 ? f.w * 3.0 : 0.0;              \
+            @if (own_depth) {                                                   \
+                uint cid = dc_cid[dc_lab[d * size.x * size.y + idx]];           \
+                dep = cid < ${const uint: DC_MAXC} ? float(dc_rank[cid]) : 0.0; \
+            @}                                                                  \
+            @if (dmode == 2) {                                                  \
+                uint st = ${uint: obj->dc_pair};                                \
+                dep = dc_mark[d * size.x * size.y + idx] == st ? 1.0 : 0.0;     \
+                /* spread to neighbours moving the same way */                  \
+                for (int r = 1; r <= ${const int: spread} && dep == 0.0; r++) { \
+                    for (int i = 0; i < 8; i++) {                               \
+                        ivec2 o = ivec2(i < 3 ? -r : i < 5 ? 0 : r,             \
+                                        i % 3 == 0 ? -r : i % 3 == 1 ? 0 : r);  \
+                        if (i == 4) o = ivec2(r, 0);                            \
+                        ivec2 np = clamp(p + o, ivec2(0), size - 1);            \
+                        if (dc_mark[d * size.x * size.y + np.y * size.x + np.x] != st)\
+                            continue;                                           \
+                        vec2 fn = d == 0 ? texelFetch($ff, np, 0).xy : texelFetch($fb, np, 0).xy;\
+                        if (length(fn - f.xy) < ${const float: tau}) { dep = 1.0; break; }\
+                    }                                                           \
+                }                                                               \
+            @}                                                                  \
+            @if (dmode == 3) {                                                  \
+                /* in front if the own frame's pixel at the landing spot is */  \
+                /* hidden there and moves differently */                        \
+                ivec2 s2 = ivec2(floor(vec2(p) + f.xy + 0.5));                  \
+                dep = 0.0;                                                      \
+                if (all(greaterThanEqual(s2, ivec2(0))) && all(lessThan(s2, size))) {\
+                    vec4 fs = d == 0 ? texelFetch($ff, s2, 0) : texelFetch($fb, s2, 0);\
+                    if (fs.z < 0.5 && length(fs.xy - f.xy) > ${const float: tau})\
+                        dep = 1.0;                                              \
+                }                                                               \
+            @}                                                                  \
+            vec2 c = (vec2(p) + 0.5) * isz, q = c + f.xy * isz;                 \
+            vec3 c0 = d == 0 ? textureLod($ta, c, 0.0).rgb : textureLod($tbx, c, 0.0).rgb;\
+            vec3 c1 = d == 0 ? textureLod($tbx, q, 0.0).rgb : textureLod($ta, q, 0.0).rgb;\
+            bool hid = f.z < 0.5;                                               \
+            float cost = hid ? 0.1 : abs(dot(c0 - c1, lw));                     \
+            uint cq;                                                            \
+            @if (tb == 0)                                                       \
+                cq = uint(min(cost * 1024.0, 255.0)) << 21;                     \
+            @if (tb == 1)                                                       \
+                cq = 0u;                                                        \
+            @if (tb == 2)                                                       \
+                cq = uint(min(cost * 64.0, 15.0)) << 25;                        \
+            uint pre = (3u - uint(clamp(round(dep), 0.0, 3.0))) << 30           \
+                     | (hid ? 1u << 29 : 0u) | cq;                              \
+            dc_src[d * size.x * size.y + idx] = uvec2(packHalf2x16(f.xy), pre); \
+        }                                                                       \
+    @}                                                                          \
+    }
+        // clang-format on
+        if (!pl_dispatch_compute(dp, pl_dispatch_compute_params(
+                .shader = &sh,
+                .dispatch_size = { PL_DIV_UP(w, dim), PL_DIV_UP(h, dim), 1 })))
+            return false;
+    }
+    obj->dc_dirty = false;
+    return true;
+}
+
+// EXPERIMENT: stage D, per vsync: splat into dc_key[cur], clear dc_key[!cur].
+// LM_SPLAT_NEAR=1: only the side nearer to t splats all its pixels, the far
+// side only those hidden in the near frame.
+static bool dc_splat(struct sh_motion_obj *obj, pl_dispatch dp, float t)
+{
+    const int w = obj->flow.dense_fwd->params.w, h = obj->flow.dense_fwd->params.h;
+    const size_t n = (size_t) w * h;
+    const int tb = dc_env("LM_SPLAT_TB", 0);
+    const bool near = dc_env("LM_SPLAT_NEAR", 0);
+    const int cur = ++obj->dc_frame & 1;
+    const int dim = 16;
+    pl_shader sh = pl_dispatch_begin(dp);
+    sh->output = PL_SHADER_SIG_NONE;
+    sh_describe(sh, "splat (per vsync)");
+    if (!sh_try_compute(sh, dim, dim, false, 0)) {
+        pl_dispatch_abort(dp, &sh);
+        return false;
+    }
+    struct pl_buffer_var vs = dc_var("dc_src", 2, 2 * n);
+    struct pl_buffer_var vc = dc_var("dc_cur", 1, n), vn = dc_var("dc_next", 1, n);
+    bind_buf(sh, "dc_src_buf", obj->dc_src, PL_DESC_ACCESS_READONLY, &vs, 1);
+    bind_buf(sh, "dc_cur_buf", obj->dc_key[cur], PL_DESC_ACCESS_READWRITE, &vc, 1);
+    bind_buf(sh, "dc_next_buf", obj->dc_key[!cur], PL_DESC_ACCESS_WRITEONLY, &vn, 1);
+    const int near_dir = t < 0.5f ? 0 : 1;
+    // clang-format off
+#pragma GLSL /* EXPERIMENT splat */                                             \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);                                  \
+    float t = ${float: t};                                                      \
+    if (all(lessThan(p, size))) {                                               \
+    int idx = p.y * size.x + p.x;                                               \
+    dc_next[idx] = 0xFFFFFFFFu;                                                 \
+    for (int d = 0; d < 2; d++) {                                               \
+        uvec2 sv = dc_src[d * size.x * size.y + idx];                           \
+        vec2 f = unpackHalf2x16(sv.x);                                          \
+        @if (near) {                                                            \
+            /* far side: only content the near frame lacks */                   \
+            vec2 e = vec2(p) + f;                                               \
+            if (d != ${const int: near_dir} && (sv.y & (1u << 29)) == 0u &&     \
+                all(greaterThanEqual(e, vec2(-0.5))) &&                         \
+                all(lessThan(e, vec2(size) - 0.5)))                             \
+                continue;                                                       \
+        @}                                                                      \
+        vec2 tp = vec2(p) + (d == 0 ? t : 1.0 - t) * f;                         \
+        ivec2 q = ivec2(floor(tp + 0.5));                                       \
+        ivec2 off = p - q;                                                      \
+        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size)) ||     \
+            any(greaterThan(abs(off), ivec2(511))))                             \
+            continue;                                                           \
+        uint key = sv.y | (uint(d) << 20) | (uint(off.y + 512) << 10)           \
+                 | uint(off.x + 512);                                           \
+        @if (tb == 1 || tb == 2) {                                              \
+            float dist = length(tp - vec2(q)) * 1.4142;                         \
+            key |= uint(min(dist * ${const float: tb == 1 ? 255.0f : 15.0f},   \
+                            ${const float: tb == 1 ? 255.0f : 15.0f})) << 21;   \
+        @}                                                                      \
+        atomicMin(dc_cur[q.y * size.x + q.x], key);                             \
+    }                                                                           \
+    }
+    // clang-format on
+    return pl_dispatch_compute(dp, pl_dispatch_compute_params(
+        .shader = &sh, .dispatch_size = { PL_DIV_UP(w, dim), PL_DIV_UP(h, dim), 1 }));
+}
+
+static const struct pl_buffer_var splat_var = {
+    .var = { .name = "splat_key", .type = PL_VAR_UINT, .dim_v = 1, .dim_m = 1, .dim_a = 0 },
+    .layout = { .offset = 0, .stride = 4, .size = 4 },
+};
+
+// EXPERIMENT: per-vsync field at `t` by forward splatting both flow fields.
+// Key per target pixel (atomicMin): depth rank (2 bits, front first), hidden in
+// the other frame (1), photometric cost (7), source index (22, incl. direction).
+// Holes are left empty (vis = 0), so the direct path falls back there.
+bool pl_motion_debug_splat(pl_shader_obj state, pl_dispatch dp, pl_tex a, pl_tex b, float t)
+{
+    struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
+                                              struct sh_motion_obj);
+    if (!obj || !obj->flow.dense_fwd || !obj->flow.dense_bwd)
+        return false;
+    pl_gpu gpu = state->gpu;
+    const int w = obj->flow.dense_fwd->params.w, h = obj->flow.dense_fwd->params.h;
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16,
+                             PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_STORABLE);
+    for (int i = 0; i < 2; i++) {
+        if (!pl_tex_recreate(gpu, &obj->dbg_vsync[i], pl_tex_params(
+                .w = w, .h = h, .format = fmt, .sampleable = true, .storable = true,
+                .host_writable = true)))
+            return false;
+    }
+    if (!obj->dbg_splat || obj->dbg_splat->params.size < (size_t) w * h * 4) {
+        pl_buf_destroy(gpu, &obj->dbg_splat);
+        obj->dbg_splat = pl_buf_create(gpu, pl_buf_params(
+            .size = (size_t) w * h * 4, .storable = true));
+        if (!obj->dbg_splat)
+            return false;
+    }
+    const int dim = 16;
+    for (int pass = 0; pass < 3; pass++) {
+        pl_shader sh = pl_dispatch_begin(dp);
+        sh->output = PL_SHADER_SIG_NONE;
+        static const char *names[] = { "splat clear", "splat (both directions)", "splat resolve" };
+        sh_describe(sh, names[pass]);
+        if (!sh_try_compute(sh, dim, dim, false, 0)) {
+            pl_dispatch_abort(dp, &sh);
+            return false;
+        }
+        struct pl_buffer_var sv = splat_var;
+        sv.var.dim_a = w * h;
+        sv.layout.size = (size_t) w * h * 4;
+        bind_buf(sh, "splat_buf", obj->dbg_splat, PL_DESC_ACCESS_READWRITE, &sv, 1);
+        ident_t ff = bind_tex(sh, "splat_fwd", obj->flow.dense_fwd);
+        ident_t fb = bind_tex(sh, "splat_bwd", obj->flow.dense_bwd);
+        ident_t ta = bind_tex(sh, "splat_a", a);
+        ident_t tb = bind_tex(sh, "splat_b", b);
+        ident_t o0 = bind_img(sh, "splat_ab", obj->dbg_vsync[0]);
+        ident_t o1 = bind_img(sh, "splat_vis", obj->dbg_vsync[1]);
+        // clang-format off
+#pragma GLSL /* EXPERIMENT splat */                                             \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);                                  \
+    float t = ${float: t};                                                      \
+    if (all(lessThan(p, size))) {                                               \
+    int idx = p.y * size.x + p.x;                                               \
+    @if (pass == 0) {                                                           \
+        splat_key[idx] = 0xFFFFFFFFu;                                           \
+    @}                                                                          \
+    @if (pass == 1) {                                                           \
+        for (int d = 0; d < 2; d++) {                                           \
+            vec4 f = d == 0 ? texelFetch($ff, p, 0) : texelFetch($fb, p, 0);    \
+            float s = d == 0 ? t : 1.0 - t;                                     \
+            ivec2 q = ivec2(round(vec2(p) + s * f.xy));                         \
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size)))   \
+                continue;                                                       \
+            ivec2 r = clamp(ivec2(round(vec2(p) + f.xy)), ivec2(0), size - 1);  \
+            vec3 c0 = d == 0 ? texelFetch($ta, p, 0).rgb : texelFetch($tb, p, 0).rgb;\
+            vec3 c1 = d == 0 ? texelFetch($tb, r, 0).rgb : texelFetch($ta, r, 0).rgb;\
+            const vec3 lw = vec3(0.2126, 0.7152, 0.0722);                       \
+            bool hid = f.z < 0.5;                                               \
+            float cost = hid ? 0.1 : abs(dot(c0 - c1, lw));                     \
+            uint key = (uint(round((1.0 - clamp(f.w, 0.0, 1.0)) * 3.0)) << 30)  \
+                     | (hid ? 1u << 29 : 0u)                                    \
+                     | (uint(min(cost * 254.0, 127.0)) << 22)                   \
+                     | uint(d * size.x * size.y + idx);                         \
+            atomicMin(splat_key[q.y * size.x + q.x], key);                      \
+        }                                                                       \
+    @}                                                                          \
+    @if (pass == 2) {                                                           \
+        uint key = splat_key[idx];                                              \
+        vec4 ab = vec4(0.0), vis = vec4(0.0);                                   \
+        if (key != 0xFFFFFFFFu) {                                               \
+            int src = int(key & 0x3FFFFFu);                                     \
+            int d = src >= size.x * size.y ? 1 : 0;                             \
+            src -= d * size.x * size.y;                                         \
+            ivec2 sp = ivec2(src % size.x, src / size.x);                       \
+            vec4 f = d == 0 ? texelFetch($ff, sp, 0) : texelFetch($fb, sp, 0);  \
+            float v = f.z > 0.5 ? 1.0 : 0.0;                                    \
+            if (d == 0) {                                                       \
+                ab = vec4(-t * f.xy, (1.0 - t) * f.xy);                         \
+                vis = vec4(1.0, v, 0.0, 0.0);                                   \
+            } else {                                                            \
+                ab = vec4(t * f.xy, -(1.0 - t) * f.xy);                         \
+                vis = vec4(v, 1.0, 0.0, 0.0);                                   \
+            }                                                                   \
+        }                                                                       \
+        imageStore($o0, p, ab);                                                 \
+        imageStore($o1, p, vis);                                                \
+    @}                                                                          \
+    }
+        // clang-format on
+        if (!pl_dispatch_compute(dp, pl_dispatch_compute_params(
+                .shader = &sh,
+                .dispatch_size = { PL_DIV_UP(w, dim), PL_DIV_UP(h, dim), 1 })))
+            return false;
+    }
+    return true;
 }
 
 ident_t sh_motion_flow(pl_shader sh, pl_shader_obj state,
@@ -1873,6 +2634,7 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
 
     obj->sig_a = input->a.sig;
     obj->sig_b = input->b.sig;
+    obj->dc_dirty = true;
 
     const int levels = pyramid_num_levels(w, h, params);
     pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 1, 16, 0,
@@ -2331,6 +3093,12 @@ static bool frame_interp_local(pl_shader sh,
                              PL_MAX(PL_SQUARE(lm->sharp), 1e-8f);
     const float prior_max = 1.0f + (gm ? lm->global : 0.0f);
     const int num = 4 * ndir + (gm ? 1 : 0);
+    // EXPERIMENT: interpretation of the flow's z/w channels, see REPORT.md
+    const int repr = getenv("LM_REPR") ? atoi(getenv("LM_REPR")) : 0;
+    struct sh_motion_obj *dbg_obj = SH_OBJ_LOOKUP(*input->state, PL_SHADER_OBJ_MOTION,
+                                                  struct sh_motion_obj);
+    const bool vsync = getenv("LM_VSYNC") && atoi(getenv("LM_VSYNC")) &&
+                       dbg_obj && dbg_obj->dbg_vsync[0];
 
     // clang-format off
 #pragma GLSLH /* frame_interp_local */                                          \
@@ -2348,23 +3116,26 @@ static bool frame_interp_local(pl_shader sh,
                                                                                 \
     /* Mix both frames compensated by the motion `mv` (in source pixels), and   \
      * return the mismatch between the two samples in `err`. */                 \
-    vec4 lm_pair(vec2 pa, vec2 pb, vec2 mv, float t, out float err) {           \
+    vec4 lm_pair(vec2 pa, vec2 pb, vec2 mv, float t, vec2 vis, out float err) { \
         vec2 qa = pa - t * mv * ${pt[0]};                                       \
         vec2 qb = pb + (1.0 - t) * mv * ${pt[1]};                               \
         vec4 ca = lm_sample_a(qa);                                              \
         vec4 cb = lm_sample_b(qb);                                              \
-        float wa = (1.0 - t) * lm_inside(qa);                                   \
-        float wb = t * lm_inside(qb);                                           \
+        float wa = (1.0 - t) * lm_inside(qa) * vis.x;                           \
+        float wb = t * lm_inside(qb) * vis.y;                                   \
         /* Without both samples there is no evidence either way. */             \
-        err = wa > 0.0 && wb > 0.0 ? abs(lm_luma(ca) - lm_luma(cb))             \
-                                   : ${float: lm->sigma};                       \
+        err = wa > 0.0 && wb > 0.0                                              \
+            ? mix(${float: lm->sigma}, abs(lm_luma(ca) - lm_luma(cb)),          \
+                  min(vis.x, vis.y))                                            \
+            : ${float: lm->sigma};                                              \
         return wa + wb > 0.0 ? (wa * ca + wb * cb) / (wa + wb)                  \
                              : mix(ca, cb, t);                                  \
     }
     // clang-format on
 
+    ident_t cubic_id[2] = {0};
     if (sharp) {
-        ident_t cubic[2];
+        ident_t *cubic = cubic_id;
         for (int i = 0; i < 2; i++) {
             cubic[i] = sh_fresh(sh, "lm_cubic");
             // clang-format off
@@ -2398,17 +3169,149 @@ static bool frame_interp_local(pl_shader sh,
 
         // clang-format off
 #pragma GLSLH /* frame_interp_local */                                          \
-    vec4 lm_pair_sharp(vec2 pa, vec2 pb, vec2 mv, float t) {                    \
+    vec4 lm_pair_sharp(vec2 pa, vec2 pb, vec2 mv, float t, vec2 vis) {          \
         vec2 qa = pa - t * mv * ${pt[0]};                                       \
         vec2 qb = pb + (1.0 - t) * mv * ${pt[1]};                               \
         vec4 ca = ${cubic[0]}(qa);                                              \
         vec4 cb = ${cubic[1]}(qb);                                              \
-        float wa = (1.0 - t) * lm_inside(qa);                                   \
-        float wb = t * lm_inside(qb);                                           \
+        float wa = (1.0 - t) * lm_inside(qa) * vis.x;                           \
+        float wb = t * lm_inside(qb) * vis.y;                                   \
         return wa + wb > 0.0 ? (wa * ca + wb * cb) / (wa + wb)                  \
                              : mix(ca, cb, t);                                  \
     }
         // clang-format on
+    }
+
+    if (getenv("LM_SPLAT") && sharp && dbg_obj && dbg_obj->flow.dense_bwd) {
+        // EXPERIMENT: stage D (splat) + C reading its key buffer directly
+        if (dbg_obj->dc_dirty || !dbg_obj->dc_src) {
+            if (!dc_prepare(dbg_obj, input->gpu, input->dispatch, input->a.tex, input->b.tex))
+                return false;
+        }
+        if (!dc_splat(dbg_obj, input->dispatch, t))
+            return false;
+        const int w = dbg_obj->flow.dense_fwd->params.w, h = dbg_obj->flow.dense_fwd->params.h;
+        const size_t n = (size_t) w * h;
+        struct pl_buffer_var vs = dc_var("dc_src", 2, 2 * n), vk = dc_var("dc_key", 1, n);
+        bind_buf(sh, "dc_src_buf", dbg_obj->dc_src, PL_DESC_ACCESS_READONLY, &vs, 1);
+        bind_buf(sh, "dc_key_buf", dbg_obj->dc_key[dbg_obj->dc_frame & 1],
+                 PL_DESC_ACCESS_READONLY, &vk, 1);
+        const int hole = dc_env("LM_SPLAT_HOLE", 2); // radius searched for holes
+        const bool bilin = dc_env("LM_SPLAT_BILIN", 0);
+        const bool dbg = dc_env("LM_SPLAT_DEBUG", 0);
+        const int holechk = dc_env("LM_SPLAT_HOLECHK", 0);
+        // clang-format off
+#pragma GLSL /* EXPERIMENT splat C */                                           \
+    vec4 color;                                                                 \
+    {                                                                           \
+    float t = ${dynamic float: t};                                              \
+    vec2 pa = ${pos[0]}, pb = ${pos[1]};                                        \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 px = clamp(ivec2(floor(pa * vec2(size))), ivec2(0), size - 1);        \
+    uint key = dc_key[px.y * size.x + px.x];                                    \
+    ivec2 kp = px;                                                              \
+    @if (hole > 0) {                                                            \
+    if (key == 0xFFFFFFFFu) {                                                   \
+        /* background-most neighbour, then the lowest key */                    \
+        uint best = 0u;                                                         \
+        for (int r = 1; r <= ${const int: hole} && best == 0u; r++) {           \
+            for (int dy = -r; dy <= r; dy++) {                                  \
+                for (int dx = -r; dx <= r; dx++) {                              \
+                    if (max(abs(dx), abs(dy)) != r)                             \
+                        continue;                                               \
+                    ivec2 np = clamp(px + ivec2(dx, dy), ivec2(0), size - 1);   \
+                    uint nk = dc_key[np.y * size.x + np.x];                     \
+                    uint sc = nk == 0xFFFFFFFFu ? 0u : nk ^ 0x3FFFFFFFu;        \
+                    if (sc > best) { best = sc; kp = np; }                      \
+                }                                                               \
+            }                                                                   \
+        }                                                                       \
+        if (best != 0u)                                                         \
+            key = best ^ 0x3FFFFFFFu;                                           \
+    }                                                                           \
+    @}                                                                          \
+    vec2 to_a = vec2(0.0), to_b = vec2(0.0), vis = vec2(0.0);                   \
+    if (key != 0xFFFFFFFFu) {                                                   \
+        int d = int((key >> 20) & 1u);                                          \
+        ivec2 sp = kp + ivec2(int(key & 1023u), int((key >> 10) & 1023u)) - 512;\
+        vec2 f = unpackHalf2x16(dc_src[d * size.x * size.y + sp.y * size.x + sp.x].x);\
+        float v = (key & (1u << 29)) != 0u ? 0.0 : 1.0;                         \
+        if (d == 0) {                                                           \
+            to_a = -t * f; to_b = (1.0 - t) * f; vis = vec2(1.0, v);            \
+        } else {                                                                \
+            to_a = t * f; to_b = -(1.0 - t) * f; vis = vec2(v, 1.0);            \
+        }                                                                       \
+        @if (holechk) {                                                         \
+        if (kp != px) {                                                         \
+            /* borrowed vector: per side, look for a pixel moving with it at */ \
+            /* or next to its endpoint, and sample there */                     \
+            vec2 ff = d == 0 ? f : -f;                                          \
+            vec2 sa = vec2(0.0), sb = vec2(0.0);                                \
+            vec2 ea = vec2(px) + to_a, eb = vec2(px) + to_b;                    \
+            ivec2 ia = ivec2(floor(ea + 0.5)), ib = ivec2(floor(eb + 0.5));     \
+            const ivec2 ofs[9] = ivec2[9](ivec2(0, 0), ivec2(1, 0), ivec2(-1, 0),\
+                ivec2(0, 1), ivec2(0, -1), ivec2(1, 1), ivec2(-1, 1),           \
+                ivec2(1, -1), ivec2(-1, -1));                                   \
+            vis = vec2(0.0);                                                    \
+            for (int i = 0; i < ${const int: holechk == 1 ? 1 : 9}; i++) {      \
+                ivec2 qa2 = clamp(ia + ofs[i], ivec2(0), size - 1);             \
+                ivec2 qb2 = clamp(ib + ofs[i], ivec2(0), size - 1);             \
+                vec2 fa = unpackHalf2x16(dc_src[qa2.y * size.x + qa2.x].x);     \
+                vec2 fb = unpackHalf2x16(dc_src[size.x * size.y + qb2.y * size.x + qb2.x].x);\
+                if (vis.x == 0.0 && length(fa - ff) < 1.0) {                    \
+                    vis.x = 1.0; sa = vec2(ofs[i]);                             \
+                }                                                               \
+                if (vis.y == 0.0 && length(fb + ff) < 1.0) {                    \
+                    vis.y = 1.0; sb = vec2(ofs[i]);                             \
+                }                                                               \
+            }                                                                   \
+            to_a += sa; to_b += sb;                                             \
+        }                                                                       \
+        @}                                                                      \
+    }                                                                           \
+    vec2 qa = pa + to_a * ${pt[0]};                                             \
+    vec2 qb = pb + to_b * ${pt[1]};                                             \
+    float wa = (1.0 - t) * vis.x * lm_inside(qa);                               \
+    float wb = t * vis.y * lm_inside(qb);                                       \
+    @if (dbg) {                                                                 \
+        color = vec4(to_a, vis.x + (kp != px || key == 0xFFFFFFFFu ? 2.0 : 0.0), vis.y);\
+    @} else {                                                                   \
+    if (wa + wb > 0.0) {                                                        \
+        @if (bilin)                                                             \
+            color = (wa * lm_sample_a(qa) + wb * lm_sample_b(qb)) / (wa + wb);  \
+        @else                                                                   \
+            color = (wa * ${cubic_id[0]}(qa) + wb * ${cubic_id[1]}(qb)) / (wa + wb);\
+    } else {                                                                    \
+        color = mix(lm_sample_a(pa), lm_sample_b(pb), t);                       \
+    }                                                                           \
+    @}                                                                          \
+    }
+        // clang-format on
+        return true;
+    }
+
+    if (vsync && sharp && getenv("LM_DIRECT_ONLY")) {
+        ident_t vs0 = bind_tex(sh, "lm_vs_ab", dbg_obj->dbg_vsync[0]);
+        ident_t vs1 = bind_tex(sh, "lm_vs_vis", dbg_obj->dbg_vsync[1]);
+        // clang-format off
+#pragma GLSL /* EXPERIMENT direct path only */                                  \
+    vec4 color;                                                                 \
+    {                                                                           \
+    float t = ${dynamic float: t};                                              \
+    vec2 pa = ${pos[0]}, pb = ${pos[1]};                                        \
+    color = mix(lm_sample_a(pa), lm_sample_b(pb), t);                           \
+    ivec2 px = ivec2(floor(pa * vec2(textureSize($vs0, 0))));                   \
+    vec4 ab = texelFetch($vs0, px, 0);                                          \
+    vec4 vv = texelFetch($vs1, px, 0);                                          \
+    vec2 qa = pa + ab.xy * ${pt[0]};                                            \
+    vec2 qb = pb + ab.zw * ${pt[1]};                                            \
+    float wa = (1.0 - t) * vv.x * lm_inside(qa);                                \
+    float wb = t * vv.y * lm_inside(qb);                                        \
+    if (wa + wb > 0.0)                                                          \
+        color = (wa * ${cubic_id[0]}(qa) + wb * ${cubic_id[1]}(qb)) / (wa + wb);\
+    }
+        // clang-format on
+        return true;
     }
 
     // clang-format off
@@ -2421,6 +3324,7 @@ static bool frame_interp_local(pl_shader sh,
     vec4 ck[9];                                                                 \
     vec2 vk[9];                                                                 \
     float wk[9], ek[9];                                                         \
+    vec2 sk[9];                                                                 \
     ivec2 last = ivec2(${const int: flow_w}, ${const int: flow_h}) - 1;         \
     vec2 fscale = vec2(${const float: flow_sx}, ${const float: flow_sy});       \
     /* The lattice, in source pixels. */                                        \
@@ -2442,18 +3346,28 @@ static bool frame_interp_local(pl_shader sh,
         vec2 off = vec2(i & 1, i >> 1);                                         \
         vec2 x = (base + off + 0.5) * pitch;                                    \
         float tau = abs(${const float: d} - t);                                 \
-        vec3 f = texelFetch($flow, clamp(ivec2(floor(x * fscale)),              \
-                                         ivec2(0), last), 0).xyz;               \
+        vec4 f = texelFetch($flow, clamp(ivec2(floor(x * fscale)),              \
+                                         ivec2(0), last), 0);                   \
         for (int n = 0; n < ${const int: iters}; n++) {                         \
             f = texelFetch($flow, clamp(ivec2(floor((x - tau * f.xy) * fscale)),\
-                                        ivec2(0), last), 0).xyz;                \
+                                        ivec2(0), last), 0);                    \
         }                                                                       \
         vec2 w = mix(1.0 - frac, frac, off);                                    \
         int k = ${const int: 4 * d} + i;                                        \
         vk[k] = ${const float: sign} * f.xy;                                    \
-        wk[k] = w.x * w.y * ${const float: 1.0f / ndir}                         \
-              * smoothstep(${float: lm->conf_lo}, ${float: lm->conf_hi}, f.z);  \
-        ck[k] = lm_pair(pa, pb, vk[k], t, ek[k]);                               \
+        wk[k] = w.x * w.y * ${const float: 1.0f / ndir};                        \
+        float vz = clamp(f.z, 0.0, 1.0), vw = 1.0 - clamp(f.w, 0.0, 1.0);       \
+        float conf = smoothstep(${float: lm->conf_lo}, ${float: lm->conf_hi},   \
+                                vz * vw);                                       \
+        float far = 1.0;                                                        \
+        if (${const int: repr} == 0 || ${const int: repr} == 4)                 \
+            wk[k] *= conf;                                                      \
+        if (${const int: repr} == 1 || ${const int: repr} == 4)                 \
+            far = vz * vw;                                                      \
+        if (${const int: repr} == 2)                                            \
+            far = vz;                                                           \
+        sk[k] = ${const float: d} < 0.5 ? vec2(1.0, far) : vec2(far, 1.0);       \
+        ck[k] = lm_pair(pa, pb, vk[k], t, sk[k], ek[k]);                        \
     }
         // clang-format on
     }
@@ -2463,7 +3377,8 @@ static bool frame_interp_local(pl_shader sh,
 #pragma GLSL /* frame_interp_local */                                           \
     vk[${const int: num - 1}] = $gm.xy;                                         \
     wk[${const int: num - 1}] = ${float: lm->global};                           \
-    ck[${const int: num - 1}] = lm_pair(pa, pb, $gm.xy, t, ek[${const int: num - 1}]);
+    sk[${const int: num - 1}] = vec2(1.0);                                      \
+    ck[${const int: num - 1}] = lm_pair(pa, pb, $gm.xy, t, sk[${const int: num - 1}], ek[${const int: num - 1}]);
         // clang-format on
     }
 
@@ -2481,10 +3396,12 @@ static bool frame_interp_local(pl_shader sh,
     @}                                                                          \
     vec4 mc = vec4(0.0);                                                        \
     vec2 mv = vec2(0.0);                                                        \
+    vec2 ms = vec2(0.0);                                                        \
     float sum = 0.0;                                                            \
     for (int k = 0; k < ${const int: num}; k++) {                               \
         mc += wk[k] * ck[k];                                                    \
         mv += wk[k] * vk[k];                                                    \
+        ms += wk[k] * sk[k];                                                    \
         sum += wk[k];                                                           \
     }                                                                           \
     @if (sharp) {                                                               \
@@ -2497,7 +3414,7 @@ static bool frame_interp_local(pl_shader sh,
             }                                                                   \
             float agree = exp(-var / sum * ${float: inv_sharp2});               \
             if (agree > 0.004)                                                  \
-                mc = mix(mc, sum * lm_pair_sharp(pa, pb, mv, t), agree);        \
+                mc = mix(mc, sum * lm_pair_sharp(pa, pb, mv, t, ms / sum), agree);\
         }                                                                       \
     @}                                                                          \
     float fb = ${float: lm->fallback}                                           \
@@ -2507,6 +3424,34 @@ static bool frame_interp_local(pl_shader sh,
         color = (mc + fb * color) / (sum + fb);                                 \
     }
     // clang-format on
+
+    if (vsync && sharp) {
+        ident_t vs0 = bind_tex(sh, "lm_vs_ab", dbg_obj->dbg_vsync[0]);
+        ident_t vs1 = bind_tex(sh, "lm_vs_vis", dbg_obj->dbg_vsync[1]);
+        // 0: one-sided by visibility, 1: ignore visibility, 2: where not
+        // visible in both, keep the lattice result (3-vector "drop" semantics)
+        const int vis_mode = getenv("LM_VIS") ? atoi(getenv("LM_VIS")) : 0;
+        // clang-format off
+#pragma GLSL /* frame_interp_local: EXPERIMENT direct per-vsync path */         \
+    {                                                                           \
+    float t = ${dynamic float: t};                                              \
+    vec2 pa = ${pos[0]}, pb = ${pos[1]};                                        \
+    ivec2 px = ivec2(floor(pa * vec2(textureSize($vs0, 0))));                   \
+    vec4 ab = texelFetch($vs0, px, 0);                                          \
+    vec4 vv = texelFetch($vs1, px, 0);                                          \
+    vec2 qa = pa + ab.xy * ${pt[0]};                                            \
+    vec2 qb = pb + ab.zw * ${pt[1]};                                            \
+    int vm = ${const int: vis_mode};                                            \
+    if (vm == 1) vv.xy = vec2(1.0);                                             \
+    float wa = (1.0 - t) * vv.x * lm_inside(qa);                                \
+    float wb = t * vv.y * lm_inside(qb);                                        \
+    bool drop = vm == 2 && min(vv.x, vv.y) < 0.5;                               \
+    if (drop) { wa = (1.0 - t) * lm_inside(qa); wb = t * lm_inside(qb); }       \
+    if (wa + wb > 0.0 && !drop)                                                 \
+        color = (wa * ${cubic_id[0]}(qa) + wb * ${cubic_id[1]}(qb)) / (wa + wb);\
+    }
+        // clang-format on
+    }
 
     return true;
 }
