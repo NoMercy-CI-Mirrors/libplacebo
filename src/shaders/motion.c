@@ -2470,7 +2470,8 @@ error:
 // boundaries, where occlusions happen. Vectors that lead out of the frame get
 // no confidence at all.
 static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
-                               pl_tex ref, pl_tex tgt, pl_tex flow, pl_tex out)
+                               pl_tex ref, pl_tex tgt, pl_tex flow, pl_tex out,
+                               bool plain)
 {
     const int w = out->params.w, h = out->params.h;
     const int grid_w = flow->params.w, grid_h = flow->params.h;
@@ -2539,6 +2540,8 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
         cand[k] = texelFetch($src, p, 0).xyz;                                   \
     }                                                                           \
                                                                                 \
+    float energy = 0.0;                                                         \
+    @if (!plain) {                                                              \
     /* Texture energy of the window: its squared differences to its centre */   \
     for (int l = 0; l < ${const int: per_thread}; l++) {                        \
         int j = int(gl_LocalInvocationIndex) + l * ${const int: dim * dim};     \
@@ -2548,12 +2551,12 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     barrier();                                                                  \
     float centre = s_diff[(local.y + ${const int: win / 2}) * ${const int: tile}\
                           + local.x + ${const int: win / 2}];                   \
-    float energy = 0.0;                                                         \
     for (int j = 0; j < ${const int: win * win}; j++) {                         \
         float d = s_diff[(local.y + j / ${const int: win}) * ${const int: tile} \
                          + local.x + j % ${const int: win}] - centre;           \
         energy += d * d;                                                        \
     }                                                                           \
+    @}                                                                          \
                                                                                 \
     vec3 best = cand[0];                                                        \
     float best_ssd = 0.0, best_raw = 0.0, mean_ssd = 0.0;                       \
@@ -3032,16 +3035,16 @@ static bool splat_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
         bool hidden = f.z < 0.5;                                                \
         uint cost = uint(min(f.w * ${const float: MOTION_SPLAT_COST}, 254.0));  \
         if (hidden) {                                                           \
-            /* Only trust this if the pixel lands on a visible one moving */    \
-            /* elsewhere; the vector is unreliable otherwise, which says */     \
-            /* nothing about the visibility. */                                 \
+            /* Only trust this if the pixel lands on a visible one; the */      \
+            /* vector is unreliable otherwise, which says nothing about */      \
+            /* the visibility. */                                               \
             ivec2 q = ivec2(floor(vec2(pos) + f.xy + 0.5));                     \
             bool inside = all(greaterThanEqual(q, ivec2(0))) &&                 \
                           all(lessThan(q, size));                               \
-            vec4 o = vec4(0.0);                                                 \
+            float vis = 0.0;                                                    \
             if (inside)                                                         \
-                o = d == 0 ? texelFetch($bwd, q, 0) : texelFetch($fwd, q, 0);   \
-            hidden = inside && o.z >= 0.5 && length(o.xy + f.xy) > 0.5;         \
+                vis = d == 0 ? texelFetch($bwd, q, 0).z : texelFetch($fwd, q, 0).z;\
+            hidden = vis >= 0.5;                                                \
             if (hidden) {                                                       \
                 cost = ${const uint: MOTION_SPLAT_COST_HIDDEN};                 \
             } else if (inside) {                                                \
@@ -3607,7 +3610,8 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
                                     : obj->pyramid_prev.elem[0],
                                 prev,
                                 bmode ? obj->b_sel[d] :
-                                fwd ? obj->flow.dense_fwd : obj->flow.dense_bwd);
+                                fwd ? obj->flow.dense_fwd : obj->flow.dense_bwd,
+                                bmode && dc_env("LM_CLEAN", 1));
         if (!ok)
             break;
 
@@ -4386,6 +4390,7 @@ static bool frame_interp_splat(pl_shader sh,
         return false;
     sh_describe(sh, "frame interpolation (splat)");
 
+    const bool tap5 = dc_env("LM_C_TAP5", 1);
     ident_t tex[2], pos[2], pt[2], cubic[2];
     for (int i = 0; i < 2; i++) {
         pl_tex tx = frames[i]->tex;
@@ -4413,6 +4418,15 @@ static bool frame_interp_splat(pl_shader sh,
         vec2 p0  = (c - 1.0) * pt;                                              \
         vec2 p12 = (c + w2 / w12) * pt;                                         \
         vec2 p3  = (c + 2.0) * pt;                                              \
+        @if (tap5) {                                                            \
+        float wsum = w12.x * w0.y + (w0.x + w12.x + w3.x) * w12.y + w12.x * w3.y;\
+        return ${conv[i]}(                                                      \
+            (textureLod(${tex[i]}, vec2(p12.x, p0.y),  0.0) * w12.x * w0.y +    \
+            (textureLod(${tex[i]}, vec2(p0.x,  p12.y), 0.0) * w0.x  +           \
+             textureLod(${tex[i]}, vec2(p12.x, p12.y), 0.0) * w12.x +           \
+             textureLod(${tex[i]}, vec2(p3.x,  p12.y), 0.0) * w3.x) * w12.y +   \
+             textureLod(${tex[i]}, vec2(p12.x, p3.y),  0.0) * w12.x * w3.y) / wsum);\
+        @} else {                                                               \
         return ${conv[i]}(                                                      \
             (textureLod(${tex[i]}, vec2(p0.x,  p0.y),  0.0) * w0.x  +           \
              textureLod(${tex[i]}, vec2(p12.x, p0.y),  0.0) * w12.x +           \
@@ -4423,6 +4437,7 @@ static bool frame_interp_splat(pl_shader sh,
             (textureLod(${tex[i]}, vec2(p0.x,  p3.y),  0.0) * w0.x  +           \
              textureLod(${tex[i]}, vec2(p12.x, p3.y),  0.0) * w12.x +           \
              textureLod(${tex[i]}, vec2(p3.x,  p3.y),  0.0) * w3.x) * w3.y);    \
+        @}                                                                      \
     }
         // clang-format on
     }
