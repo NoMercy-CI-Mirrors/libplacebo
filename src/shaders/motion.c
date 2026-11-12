@@ -1879,6 +1879,91 @@ error:
 // occlusion and fill passes after the per pixel selection.
 static int motion_b_request;
 
+// EXPERIMENT (stage B): per pixel selection among the vectors of the pixel's
+// block, its 8 neighbours, blocks further away along the axes and the zero
+// vector, by the difference over a window in which each pixel counts by its
+// similarity to the centre (adaptive support weights).
+static bool motion_select_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
+                               pl_tex ref, pl_tex tgt, pl_tex blocks, pl_tex out)
+{
+    const int w = out->params.w, h = out->params.h;
+    const int win = dc_env("LM_B_SW", 5);
+    const float sigma = b_envf("LM_B_SSIG", 100.0f);
+    const int far = dc_env("LM_B_SFAR", 3);   // far rings: 2, 4, 8 blocks
+    const bool zero = dc_env("LM_B_SZERO", 1);
+    const float margin = b_envf("LM_B_SMARGIN", 1.0f) / 255.0f;
+    const int ncand = 9 + 4 * far + (zero ? 1 : 0);
+    const int l2 = dc_env("LM_B_SL2", 1);
+
+    pl_shader sh = pl_dispatch_begin(dispatch);
+    sh_describef(sh, "motion vector selection (%dx%d)", w, h);
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 16, 16, false, 0))
+        goto error;
+
+    ident_t blk = bind_tex(sh, "blocks", blocks);
+    ident_t ref_id = bind_tex(sh, "ref", ref);
+    ident_t tgt_id = bind_tex_linear(sh, "tgt", tgt);
+    ident_t dst = bind_img(sh, "flow_out", out);
+
+    // clang-format off
+#pragma GLSL /* motion_select_pass */                                           \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 grid = ivec2(${const int: blocks->params.w},                          \
+                       ${const int: blocks->params.h});                         \
+    ivec2 pos  = ivec2(gl_GlobalInvocationID.xy);                               \
+    if (all(lessThan(pos, size))) {                                             \
+        const int W = ${const int: win};                                        \
+        vec2 pt = 1.0 / vec2(size);                                             \
+        float r[${const int: win * win}];                                       \
+        float wgt[${const int: win * win}];                                     \
+        float centre = texelFetch($ref_id, pos, 0).r;                           \
+        float wsum = 0.0;                                                       \
+        for (int i = 0; i < W * W; i++) {                                       \
+            ivec2 q = clamp(pos + ivec2(i % W, i / W) - W / 2, ivec2(0), size - 1);\
+            r[i] = texelFetch($ref_id, q, 0).r;                                 \
+            wgt[i] = exp(-abs(r[i] - centre) / ${const float: sigma});          \
+            wsum += wgt[i];                                                     \
+        }                                                                       \
+        const ivec2 ofs[21] = ivec2[21](ivec2(0, 0),                            \
+            ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0),            \
+            ivec2(1, 0), ivec2(-1, 1), ivec2(0, 1), ivec2(1, 1),                \
+            ivec2(-2, 0), ivec2(2, 0), ivec2(0, -2), ivec2(0, 2),               \
+            ivec2(-4, 0), ivec2(4, 0), ivec2(0, -4), ivec2(0, 4),               \
+            ivec2(-8, 0), ivec2(8, 0), ivec2(0, -8), ivec2(0, 8));              \
+        vec2 best = vec2(0.0);                                                  \
+        float best_cost = 1e9;                                                  \
+        for (int k = 0; k < ${const int: ncand}; k++) {                         \
+            vec2 v = vec2(0.0);                                                 \
+            if (k < ${const int: 9 + 4 * far}) {                                \
+                ivec2 b = clamp(pos / ${const int: bs} + ofs[k], ivec2(0), grid - 1);\
+                v = texelFetch($blk, b, 0).xy;                                  \
+            }                                                                   \
+            float cost = 0.0;                                                   \
+            for (int i = 0; i < W * W; i++) {                                   \
+                ivec2 q = clamp(pos + ivec2(i % W, i / W) - W / 2, ivec2(0), size - 1);\
+                float d = r[i] - textureLod($tgt_id, (vec2(q) + 0.5 + v) * pt, 0.0).r;\
+                cost += wgt[i] * (${const int: l2} != 0 ? d * d * 255.0 : abs(d));\
+            }                                                                   \
+            cost = cost / wsum + (k == 0 ? 0.0 : ${const float: margin});       \
+            if (cost < best_cost) {                                             \
+                best_cost = cost;                                               \
+                best = v;                                                       \
+            }                                                                   \
+        }                                                                       \
+        imageStore($dst, pos, vec4(best, 1.0, 0.0));                            \
+    }
+    // clang-format on
+
+    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+        .shader = &sh,
+        .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(h, 16), 1 }));
+
+error:
+    pl_dispatch_abort(dispatch, &sh);
+    return false;
+}
+
 // Stage B: marks the pixels of `flow` that are hidden in the other frame, in
 // the z channel of `out` (visibility, hidden below 0.5). A pixel is hidden if
 // following its vector and then the opposite field's (`opp`) does not lead
@@ -1895,10 +1980,10 @@ static bool motion_occlusion_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
 
     ident_t src = bind_tex(sh, "flow_in", flow);
     ident_t opp_id = bind_tex_linear(sh, "flow_opp", opp);
-    const int omode = dc_env("LM_B_OMODE", 0);
+    const int omode = dc_env("LM_B_OMODE", 1);
     ident_t ref_id = bind_tex_linear(sh, "ref", ref);
     ident_t dst = bind_img(sh, "flow_out", out);
-    const float fbt = b_envf("LM_B_FBT", 1.5f), ot = b_envf("LM_B_OT", 0.15f);
+    const float fbt = b_envf("LM_B_FBT", 1.5f), ot = b_envf("LM_B_OT", 0.04f);
     const float noise = 9.0f / (255.0f * 255.0f);
 
     // clang-format off
@@ -2796,7 +2881,16 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
                                     obj->fine[d][s], true, dbg);
             prev = obj->fine[d][s];
         }
-        ok = ok && motion_refine_pass(gpu, input->dispatch,
+        if (bmode && dc_env("LM_B_SEL", 1)) {
+            ok = ok && motion_select_pass(gpu, input->dispatch,
+                                params->block_size >> PL_MIN(nfine, 3),
+                                fwd ? obj->pyramid_prev.elem[0]
+                                    : obj->scratch.levels.elem[0],
+                                fwd ? obj->scratch.levels.elem[0]
+                                    : obj->pyramid_prev.elem[0],
+                                prev, obj->b_sel[d]);
+        } else {
+            ok = ok && motion_refine_pass(gpu, input->dispatch,
                                 params->block_size >> PL_MIN(nfine, 3),
                                 fwd ? obj->pyramid_prev.elem[0]
                                     : obj->scratch.levels.elem[0],
@@ -2806,6 +2900,7 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
                                 bmode ? obj->b_sel[d] :
                                 fwd ? obj->flow.dense_fwd : obj->flow.dense_bwd,
                                 bmode);
+        }
         if (!ok)
             break;
 
@@ -3372,6 +3467,7 @@ static bool frame_interp_splat(pl_shader sh,
     const int hole = dc_env("X_HOLE", 1);
     const int blur = dc_env("X_BLUR", 2), bstride = dc_env("X_BSTRIDE", 1);
     const unsigned blurt = dc_env("X_BLURT", 128);
+    const float blurw = b_envf("X_BLURW", 1.0f), blurself = b_envf("X_BLURSELF", 1.0f);
     const int blurh = dc_env("X_BLURH", 1), blurc = dc_env("X_BLURC", 1);
     const bool holechk = dc_env("X_HOLECHK", 0);
     const float softvis = b_envf("X_SOFTVIS", MOTION_SPLAT_SIMILAR);
@@ -3537,8 +3633,8 @@ static bool frame_interp_splat(pl_shader sh,
             if (((key & ${const uint: SPLAT_HIDDEN}) == 0u && (key >> 21 & 255u) >= ${const uint: blurt}) ||\
                 (${const int: blurc} != 0 && (key & ${const uint: SPLAT_HIDDEN}) != 0u) ||\
                 (${const int: blurh} != 0 && from != px)) {                     \
-                vec4 sum = color;                                               \
-                float num = 1.0;                                                \
+                vec4 sum = color * ${const float: blurself};                    \
+                float num = ${const float: blurself};                           \
                 for (int i = 0; i < ${const int: (2 * blur + 1) * (2 * blur + 1)}; i++) {\
                     ivec2 o = (ivec2(i % ${const int: 2 * blur + 1}, i / ${const int: 2 * blur + 1}) - ${const int: blur}) * ${const int: bstride};\
                     if (o == ivec2(0))                                          \
@@ -3559,11 +3655,14 @@ static bool frame_interp_splat(pl_shader sh,
                     vec2 nw = vec2(1.0 - t, t) * nvis * vec2(splat_inside(na), splat_inside(nb));\
                     if (nw.x + nw.y <= 0.0)                                     \
                         continue;                                               \
-                    sum += (nw.x * ${conv[0]}(textureLod(${tex[0]}, na, 0.0)) + \
+                    float rel = (nk & ${const uint: SPLAT_HIDDEN}) == 0u && (nk >> 21 & 255u) < ${const uint: blurt}\
+                              ? 1.0 : ${const float: blurw};                    \
+                    sum += rel * (nw.x * ${conv[0]}(textureLod(${tex[0]}, na, 0.0)) + \
                             nw.y * ${conv[1]}(textureLod(${tex[1]}, nb, 0.0))) / (nw.x + nw.y);\
-                    num += 1.0;                                                 \
+                    num += rel;                                                 \
                 }                                                               \
-                color = sum / num;                                              \
+                if (num > 0.0)                                                  \
+                    color = sum / num;                                          \
             }                                                                   \
             @}                                                                  \
         }                                                                       \
