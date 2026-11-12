@@ -70,7 +70,7 @@ struct sh_motion_obj {
 
     // EXPERIMENT (stage B): the selected vectors, and those with the occlusion
     // estimate, of each direction; `b_mode` is whether B ran
-    pl_tex b_sel[2], b_occ[2];
+    pl_tex b_sel[2], b_occ[2], b_shp[2];
     int b_mode;
 
     // State of the splat, see `splat_prepare`: the vector and key prefix of
@@ -670,6 +670,7 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
     for (int i = 0; i < 2; i++) {
         pl_tex_destroy(gpu, &obj->b_sel[i]);
         pl_tex_destroy(gpu, &obj->b_occ[i]);
+        pl_tex_destroy(gpu, &obj->b_shp[i]);
     }
     pl_buf_destroy(gpu, &obj->splat.src);
     pl_buf_destroy(gpu, &obj->splat.key[0]);
@@ -1884,66 +1885,97 @@ static int motion_b_request;
 // vector, by the difference over a window in which each pixel counts by its
 // similarity to the centre (adaptive support weights).
 static bool motion_select_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
-                               pl_tex ref, pl_tex tgt, pl_tex blocks, pl_tex out)
+                               pl_tex ref, pl_tex tgt, pl_tex blocks, pl_tex out,
+                               pl_tex prev_field)
 {
     const int w = out->params.w, h = out->params.h;
     const int win = dc_env("LM_B_SW", 5);
     const float sigma = b_envf("LM_B_SSIG", 100.0f);
-    const int far = dc_env("LM_B_SFAR", 3);   // far rings: 2, 4, 8 blocks
+    const int far = dc_env("LM_B_SFAR", 4);   // far rings: 2, 4, 8 blocks
     const bool zero = dc_env("LM_B_SZERO", 1);
     const float margin = b_envf("LM_B_SMARGIN", 1.0f) / 255.0f;
-    const int ncand = 9 + 4 * far + (zero ? 1 : 0);
+    const int nring = dc_env("LM_B_SDIAG", 1) ? 8 : 4;
+    const bool temp = prev_field && dc_env("LM_B_STEMP", 1);
+    const int ncand = 9 + nring * far + (zero ? 1 : 0) + (temp ? 1 : 0);
     const int l2 = dc_env("LM_B_SL2", 1);
+    const bool asw = sigma < 10.0f;
+    const float dup = PL_SQUARE(b_envf("LM_B_SDUP", 0.1f));
 
     pl_shader sh = pl_dispatch_begin(dispatch);
     sh_describef(sh, "motion vector selection (%dx%d)", w, h);
     sh->output = PL_SHADER_SIG_NONE;
-    if (!sh_try_compute(sh, 16, 16, false, 0))
+    const int dim = PL_MIN(bs, 16), sub = PL_DIV_UP(bs, dim);
+    if (!sh_try_compute(sh, dim, dim, false, 0))
         goto error;
 
     ident_t blk = bind_tex(sh, "blocks", blocks);
     ident_t ref_id = bind_tex(sh, "ref", ref);
     ident_t tgt_id = bind_tex_linear(sh, "tgt", tgt);
     ident_t dst = bind_img(sh, "flow_out", out);
+    ident_t prev_id = temp ? bind_tex(sh, "prev_field", prev_field) : NULL_IDENT;
 
     // clang-format off
 #pragma GLSL /* motion_select_pass */                                           \
     ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
     ivec2 grid = ivec2(${const int: blocks->params.w},                          \
                        ${const int: blocks->params.h});                         \
-    ivec2 pos  = ivec2(gl_GlobalInvocationID.xy);                               \
-    if (all(lessThan(pos, size))) {                                             \
+    /* one block per work group (or a part of it), which shares candidates */   \
+    ivec2 wg   = ivec2(gl_WorkGroupID.xy);                                      \
+    ivec2 lpos = wg % ${const int: sub} * ${const int: dim} + ivec2(gl_LocalInvocationID.xy);\
+    ivec2 pos  = wg / ${const int: sub} * ${const int: bs} + lpos;              \
+    if (all(lessThan(pos, size)) && all(lessThan(lpos, ivec2(${const int: bs})))) {\
         const int W = ${const int: win};                                        \
         vec2 pt = 1.0 / vec2(size);                                             \
-        float r[${const int: win * win}];                                       \
-        float wgt[${const int: win * win}];                                     \
         float centre = texelFetch($ref_id, pos, 0).r;                           \
         float wsum = 0.0;                                                       \
+        @if (asw) {                                                             \
         for (int i = 0; i < W * W; i++) {                                       \
             ivec2 q = clamp(pos + ivec2(i % W, i / W) - W / 2, ivec2(0), size - 1);\
-            r[i] = texelFetch($ref_id, q, 0).r;                                 \
-            wgt[i] = exp(-abs(r[i] - centre) / ${const float: sigma});          \
-            wsum += wgt[i];                                                     \
+            wsum += exp(-abs(texelFetch($ref_id, q, 0).r - centre) / ${const float: sigma});\
         }                                                                       \
-        const ivec2 ofs[21] = ivec2[21](ivec2(0, 0),                            \
+        @} else {                                                               \
+        wsum = float(W * W);                                                    \
+        @}                                                                      \
+        const ivec2 near[9] = ivec2[9](ivec2(0, 0),                             \
             ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0),            \
-            ivec2(1, 0), ivec2(-1, 1), ivec2(0, 1), ivec2(1, 1),                \
-            ivec2(-2, 0), ivec2(2, 0), ivec2(0, -2), ivec2(0, 2),               \
-            ivec2(-4, 0), ivec2(4, 0), ivec2(0, -4), ivec2(0, 4),               \
-            ivec2(-8, 0), ivec2(8, 0), ivec2(0, -8), ivec2(0, 8));              \
-        vec2 best = vec2(0.0);                                                  \
+            ivec2(1, 0), ivec2(-1, 1), ivec2(0, 1), ivec2(1, 1));               \
+        vec2 best = vec2(0.0), own = vec2(0.0), last = vec2(0.0);               \
         float best_cost = 1e9;                                                  \
         for (int k = 0; k < ${const int: ncand}; k++) {                         \
             vec2 v = vec2(0.0);                                                 \
-            if (k < ${const int: 9 + 4 * far}) {                                \
-                ivec2 b = clamp(pos / ${const int: bs} + ofs[k], ivec2(0), grid - 1);\
+            if (k < ${const int: 9 + nring * far}) {                            \
+                ivec2 o = near[k < 9 ? k : 0];                                  \
+                if (k >= 9) {                                                   \
+                    int j = (k - 9) % ${const int: nring};                      \
+                    @if (nring == 4)                                            \
+                        j = j == 0 ? 2 : j == 1 ? 4 : j == 2 ? 5 : 7;           \
+                    @else                                                       \
+                        j += 1;                                                 \
+                    o = near[j] * (2 << ((k - 9) / ${const int: nring}));       \
+                }                                                               \
+                ivec2 b = clamp(pos / ${const int: bs} + o, ivec2(0), grid - 1);\
                 v = texelFetch($blk, b, 0).xy;                                  \
             }                                                                   \
+            @if (temp) {                                                        \
+            if (k == ${const int: ncand - 1})                                   \
+                v = texelFetch($prev_id, pos, 0).xy;                            \
+            @}                                                                  \
+            /* most candidates repeat the block's own or the previous one */    \
+            vec2 d0 = v - own, d1 = v - last, d2 = v - best;                    \
+            if (k > 0 && (dot(d0, d0) < ${const float: dup} || dot(d1, d1) < ${const float: dup} || dot(d2, d2) < ${const float: dup}))\
+                continue;                                                       \
+            if (k == 0)                                                         \
+                own = v;                                                        \
+            last = v;                                                           \
             float cost = 0.0;                                                   \
             for (int i = 0; i < W * W; i++) {                                   \
                 ivec2 q = clamp(pos + ivec2(i % W, i / W) - W / 2, ivec2(0), size - 1);\
-                float d = r[i] - textureLod($tgt_id, (vec2(q) + 0.5 + v) * pt, 0.0).r;\
-                cost += wgt[i] * (${const int: l2} != 0 ? d * d * 255.0 : abs(d));\
+                float ri = texelFetch($ref_id, q, 0).r;                         \
+                float d = ri - textureLod($tgt_id, (vec2(q) + 0.5 + v) * pt, 0.0).r;\
+                float wi = 1.0;                                                 \
+                @if (asw)                                                       \
+                    wi = exp(-abs(ri - centre) / ${const float: sigma});        \
+                cost += wi * (${const int: l2} != 0 ? d * d * 255.0 : abs(d));  \
             }                                                                   \
             cost = cost / wsum + (k == 0 ? 0.0 : ${const float: margin});       \
             if (cost < best_cost) {                                             \
@@ -1952,6 +1984,73 @@ static bool motion_select_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
             }                                                                   \
         }                                                                       \
         imageStore($dst, pos, vec4(best, 1.0, 0.0));                            \
+    }
+    // clang-format on
+
+    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+        .shader = &sh,
+        .dispatch_size = { blocks->params.w * sub, blocks->params.h * sub, 1 }));
+
+error:
+    pl_dispatch_abort(dispatch, &sh);
+    return false;
+}
+
+// EXPERIMENT (stage B): the selection window drags the pixels next to a
+// motion boundary along with the side of higher contrast. Where a pixel's
+// neighbours move differently, let it take a neighbour's vector if the pixel
+// itself matches clearly better that way.
+static bool motion_sharpen_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
+                                pl_tex tgt, pl_tex flow, pl_tex out)
+{
+    const int w = out->params.w, h = out->params.h;
+    const int rad = dc_env("LM_B_SHR", 2);
+    const float tau = b_envf("LM_B_SHT", 4.0f) / 255.0f;
+    const float rel = b_envf("LM_B_SHREL", 0.5f);
+    pl_shader sh = pl_dispatch_begin(dispatch);
+    sh_describef(sh, "motion boundary sharpening (%dx%d)", w, h);
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 16, 16, false, 0))
+        goto error;
+
+    ident_t src = bind_tex(sh, "flow_in", flow);
+    ident_t ref_id = bind_tex(sh, "ref", ref);
+    ident_t tgt_id = bind_tex_linear(sh, "tgt", tgt);
+    ident_t dst = bind_img(sh, "flow_out", out);
+
+    // clang-format off
+#pragma GLSL /* motion_sharpen_pass */                                          \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 pos  = ivec2(gl_GlobalInvocationID.xy);                               \
+    if (all(lessThan(pos, size))) {                                             \
+        vec2 pt = 1.0 / vec2(size);                                             \
+        vec4 f = texelFetch($src, pos, 0);                                      \
+        float centre = texelFetch($ref_id, pos, 0).r;                           \
+        float own = -1.0, best = 0.0;                                           \
+        vec2 pick = f.xy;                                                       \
+        vec2 last = f.xy;                                                       \
+        for (int r = 1; r <= ${const int: rad}; r++) {                          \
+            for (int i = 0; i < 9; i++) {                                       \
+                if (i == 4)                                                     \
+                    continue;                                                   \
+                ivec2 q = clamp(pos + (ivec2(i % 3, i / 3) - 1) * r, ivec2(0), size - 1);\
+                vec2 v = texelFetch($src, q, 0).xy;                             \
+                vec2 d = v - f.xy, e = v - last;                                \
+                if (dot(d, d) <= 0.25 || dot(e, e) <= 0.01)                     \
+                    continue;                                                   \
+                last = v;                                                       \
+                if (own < 0.0) {                                                \
+                    own = abs(centre - textureLod($tgt_id, (vec2(pos) + 0.5 + f.xy) * pt, 0.0).r);\
+                    best = own * ${const float: rel} - ${const float: tau};     \
+                }                                                               \
+                float c = abs(centre - textureLod($tgt_id, (vec2(pos) + 0.5 + v) * pt, 0.0).r);\
+                if (c < best) {                                                 \
+                    best = c;                                                   \
+                    pick = v;                                                   \
+                }                                                               \
+            }                                                                   \
+        }                                                                       \
+        imageStore($dst, pos, vec4(pick, f.zw));                                \
     }
     // clang-format on
 
@@ -2275,6 +2374,7 @@ static bool splat_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
 
     sh = pl_dispatch_begin(dp);
     const int xconf = dc_env("X_CONF", 1);
+    const float expl_d = b_envf("X_EXPLD", 0.5f), expl_t = b_envf("X_EXPLT", 0.5f);
     sh_describe(sh, "splat source packing");
     sh->output = PL_SHADER_SIG_NONE;
     if (!sh_try_compute(sh, 16, 16, false, 0)) {
@@ -2305,11 +2405,23 @@ static bool splat_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
             bool inside = all(greaterThanEqual(q, ivec2(0))) &&                 \
                           all(lessThan(q, size));                               \
             float vis = 0.0;                                                    \
-            if (inside)                                                         \
-                vis = d == 0 ? texelFetch($bwd, q, 0).z : texelFetch($fwd, q, 0).z;\
+            vec3 o = vec3(0.0);                                                 \
+            if (inside) {                                                       \
+                o = d == 0 ? texelFetch($bwd, q, 0).xyz : texelFetch($fwd, q, 0).xyz;\
+                vis = o.z;                                                      \
+            }                                                                   \
             hidden = vis >= 0.5 || ${const int: xconf} == 0;                    \
             if (hidden) {                                                       \
-                cost = ${const uint: MOTION_SPLAT_COST_HIDDEN};                 \
+                /* Explained, if what covers it moves elsewhere and comes */    \
+                /* from a pixel of this frame that agrees with that */          \
+                bool explained = false;                                         \
+                ivec2 r = ivec2(floor(vec2(q) + o.xy + 0.5));                   \
+                if (inside && length(o.xy + f.xy) > ${const float: expl_d} &&   \
+                    all(greaterThanEqual(r, ivec2(0))) && all(lessThan(r, size))) {\
+                    vec3 fr = d == 0 ? texelFetch($fwd, r, 0).xyz : texelFetch($bwd, r, 0).xyz;\
+                    explained = length(fr.xy + o.xy) < ${const float: expl_t} && fr.z >= 0.5;\
+                }                                                               \
+                cost = ${const uint: MOTION_SPLAT_COST_HIDDEN} + (explained ? 0u : 1u);\
             } else if (inside) {                                                \
                 cost = 255u;                                                    \
             }                                                                   \
@@ -2602,9 +2714,18 @@ static bool motion_b_post(pl_gpu gpu, pl_dispatch dispatch,
 {
     pl_tex luma[2] = { luma_a, luma_b };
     pl_tex dense[2] = { obj->flow.dense_fwd, obj->flow.dense_bwd };
+    pl_tex sel[2] = { obj->b_sel[0], obj->b_sel[1] };
+    for (int d = 0; d < 2 && dc_env("LM_B_SHARP", 0); d++) {
+        if (!dense_flow_recreate(gpu, &obj->b_shp[d], obj->w, obj->h,
+                                 obj->b_sel[d]->params.format) ||
+            !motion_sharpen_pass(gpu, dispatch, luma[d], luma[!d], obj->b_sel[d],
+                                 obj->b_shp[d]))
+            return false;
+        sel[d] = obj->b_shp[d];
+    }
     for (int d = 0; d < 2; d++) {
-        if (!motion_occlusion_pass(gpu, dispatch, luma[d], obj->b_sel[d],
-                                   obj->b_sel[!d], obj->b_occ[d]) ||
+        if (!motion_occlusion_pass(gpu, dispatch, luma[d], sel[d],
+                                   sel[!d], obj->b_occ[d]) ||
             !motion_fill_pass(gpu, dispatch, luma[d], luma[!d], obj->b_occ[d],
                               dense[d]))
             return false;
@@ -2888,7 +3009,9 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
                                     : obj->scratch.levels.elem[0],
                                 fwd ? obj->scratch.levels.elem[0]
                                     : obj->pyramid_prev.elem[0],
-                                prev, obj->b_sel[d]);
+                                prev, obj->b_sel[d],
+                                has_prior ? (fwd ? obj->flow.dense_fwd
+                                                 : obj->flow.dense_bwd) : NULL);
         } else {
             ok = ok && motion_refine_pass(gpu, input->dispatch,
                                 params->block_size >> PL_MIN(nfine, 3),
@@ -3631,7 +3754,9 @@ static bool frame_interp_splat(pl_shader sh,
             /* No trustworthy vector: rather than one arbitrary warp, mix */    \
             /* the warps the pixels around this one would use here */           \
             if (((key & ${const uint: SPLAT_HIDDEN}) == 0u && (key >> 21 & 255u) >= ${const uint: blurt}) ||\
-                (${const int: blurc} != 0 && (key & ${const uint: SPLAT_HIDDEN}) != 0u) ||\
+                (${const int: blurc} == 1 && (key & ${const uint: SPLAT_HIDDEN}) != 0u) ||\
+                (${const int: blurc} == 2 && (key & ${const uint: SPLAT_HIDDEN}) != 0u &&\
+                 (key >> 21 & 255u) != ${const uint: MOTION_SPLAT_COST_HIDDEN}) ||\
                 (${const int: blurh} != 0 && from != px)) {                     \
                 vec4 sum = color * ${const float: blurself};                    \
                 float num = ${const float: blurself};                           \
