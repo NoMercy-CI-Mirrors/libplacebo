@@ -175,14 +175,6 @@ PL_API pl_tex pl_motion_debug_fine(pl_shader_obj state, int dir);
 PL_API bool pl_motion_debug_set_flow(pl_shader_obj state,
                                      enum pl_motion_direction dir,
                                      const void *data);
-// EXPERIMENT: per-vsync field for LM_VSYNC=1: `to_ab` = (to_a.xy, to_b.xy) in
-// pixels, `vis` = (vis_a, vis_b, 0, 0); both rgba16f, w x h.
-// EXPERIMENT: build the LM_VSYNC field at `t` on the GPU by splatting the
-// flow fields (channel w = depth rank, front = 1).
-PL_API bool pl_motion_debug_splat(pl_shader_obj state, pl_dispatch dp,
-                                  pl_tex a, pl_tex b, float t);
-PL_API bool pl_motion_debug_set_vsync(pl_shader_obj state, int w, int h,
-                                      const void *to_ab, const void *vis);
 
 // Returns the buffer holding the global motion vector in the direction `dir`
 // or NULL if no `pl_motion_estimate` call for the current frame pair set
