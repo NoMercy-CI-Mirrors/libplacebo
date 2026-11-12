@@ -760,6 +760,31 @@ bool pl_motion_debug_set_flow(pl_shader_obj state, enum pl_motion_direction dir,
     return pl_tex_upload(state->gpu, pl_tex_transfer_params(.tex = tex, .ptr = (void *) data));
 }
 
+static bool motion_b_post(pl_gpu gpu, pl_dispatch dispatch,
+                          struct sh_motion_obj *obj, pl_tex luma_a, pl_tex luma_b);
+
+// EXPERIMENT: the per pixel selection of `dir` (0 fwd, 1 bwd), before the
+// occlusion and fill passes
+pl_tex pl_motion_debug_get_sel(pl_shader_obj state, int dir)
+{
+    struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
+                                              struct sh_motion_obj);
+    return obj ? obj->b_sel[dir] : NULL;
+}
+
+// EXPERIMENT: re-run the occlusion and fill passes on the (modified) selection
+bool pl_motion_debug_redo_b(pl_shader_obj state, pl_dispatch dp)
+{
+    struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
+                                              struct sh_motion_obj);
+    if (!obj || !obj->b_mode)
+        return false;
+    obj->splat.dirty = true;
+    // after the estimate, frame a's luma is in the scratch pyramid
+    return motion_b_post(state->gpu, dp, obj, obj->scratch.levels.elem[0],
+                         obj->pyramid_prev.elem[0]);
+}
+
 // EXPERIMENT (stage B): tunables read from the environment
 static float b_envf(const char *name, float def)
 {
@@ -1870,6 +1895,7 @@ static bool motion_occlusion_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
 
     ident_t src = bind_tex(sh, "flow_in", flow);
     ident_t opp_id = bind_tex_linear(sh, "flow_opp", opp);
+    const int omode = dc_env("LM_B_OMODE", 0);
     ident_t ref_id = bind_tex_linear(sh, "ref", ref);
     ident_t dst = bind_img(sh, "flow_out", out);
     const float fbt = b_envf("LM_B_FBT", 1.5f), ot = b_envf("LM_B_OT", 0.15f);
@@ -1883,6 +1909,16 @@ static bool motion_occlusion_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
         vec2 pt = 1.0 / vec2(size);                                             \
         vec2 f = texelFetch($src, pos, 0).xy;                                   \
         vec2 rt = f + textureLod($opp_id, (vec2(pos) + 0.5 + f) * pt, 0.0).xy;  \
+        @if (omode >= 1) {                                                      \
+        /* any of the pixels around the landing point may be the counterpart */ \
+        ivec2 base = ivec2(floor(vec2(pos) + f)) - ${const int: omode - 1};     \
+        for (int i = 0; i < ${const int: (omode + 1) * (omode + 1)}; i++) {     \
+            ivec2 q = clamp(base + ivec2(i % ${const int: omode + 1}, i / ${const int: omode + 1}), ivec2(0), size - 1);\
+            vec2 r2 = f + texelFetch($opp_id, q, 0).xy;                         \
+            if (dot(r2, r2) < dot(rt, rt))                                      \
+                rt = r2;                                                        \
+        }                                                                       \
+        @}                                                                      \
         float vis = 1.0 / (1.0 + dot(rt, rt) / ${const float: fbt * fbt});      \
         if (vis < 0.5) {                                                        \
             float centre = texelFetch($ref_id, pos, 0).r;                       \
@@ -1931,6 +1967,8 @@ static bool motion_fill_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
     ident_t ref_id = bind_tex(sh, "ref", ref);
     ident_t tgt_id = bind_tex_linear(sh, "tgt", tgt);
     ident_t dst = bind_img(sh, "flow_out", out);
+    const int wmode = dc_env("LM_B_WMODE", 2);
+    const float wnorm = b_envf("LM_B_WNORM", 1.0f);
 
     // clang-format off
 #pragma GLSL /* motion_fill_pass */                                             \
@@ -1981,6 +2019,18 @@ static bool motion_fill_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
                                                                                 \
         vec2 to = (vec2(pos) + vec2(0.5) + f.xy) / vec2(size);                  \
         f.w = abs(centre - textureLod($tgt_id, to, 0.0).r);                     \
+        @if (wmode > 0) {                                                       \
+        float ssd = 0.0, energy = 0.0;                                          \
+        for (int j = 0; j < 9; j++) {                                           \
+            ivec2 q = clamp(pos + ivec2(j % 3, j / 3) - 1, ivec2(0), size - 1); \
+            float r = texelFetch($ref_id, q, 0).r;                              \
+            float d = r - textureLod($tgt_id, (vec2(q) + vec2(0.5) + f.xy) / vec2(size), 0.0).r;\
+            ssd += d * d;                                                       \
+            energy += (r - centre) * (r - centre);                              \
+        }                                                                       \
+        f.w = ${const int: wmode} == 1 ? sqrt(ssd / 9.0)                        \
+            : 0.25 * min(sqrt(ssd / (energy + ${const float: 9.0f / (255.0f * 255.0f)})) / ${const float: wnorm}, 1.0);\
+        @}                                                                      \
         imageStore($dst, pos, f);                                               \
     }
     // clang-format on
@@ -2088,7 +2138,27 @@ static bool splat_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
     ident_t fwd = bind_tex(sh, "flow_fwd", fields[0]);
     ident_t bwd = bind_tex(sh, "flow_bwd", fields[1]);
     bind_buf(sh, "splat_mark_buf", obj->splat.mark, PL_DESC_ACCESS_WRITEONLY, &mark_var, 1);
+    const int spread = dc_env("X_SPREAD", 0);
     // clang-format off
+#pragma GLSLH /* splat_prepare: layer order */                                  \
+    /* mark p of field g and the pixels around it that move with it */          \
+    void splat_stamp(int g, ivec2 p, vec2 v, uint stamp) {                      \
+        ivec2 size = ivec2(${const int: w}, ${const int: h});                   \
+        const int R = ${const int: spread};                                     \
+        for (int dy = -R; dy <= R; dy++) {                                      \
+            for (int dx = -R; dx <= R; dx++) {                                  \
+                ivec2 np = p + ivec2(dx, dy);                                   \
+                if (any(lessThan(np, ivec2(0))) || any(greaterThanEqual(np, size)))\
+                    continue;                                                   \
+                if (dx != 0 || dy != 0) {                                       \
+                    vec2 nv = g == 0 ? texelFetch($fwd, np, 0).xy : texelFetch($bwd, np, 0).xy;\
+                    if (length(nv - v) >= 0.3)                                  \
+                        continue;                                               \
+                }                                                               \
+                splat_mark[(g * size.y + np.y) * size.x + np.x] = stamp;        \
+            }                                                                   \
+        }                                                                       \
+    }
 #pragma GLSL /* splat_prepare: layer order */                                   \
     ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
     ivec2 pos  = ivec2(gl_GlobalInvocationID.xy);                               \
@@ -2104,13 +2174,13 @@ static bool splat_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
         vec2 o = d == 0 ? texelFetch($bwd, q, 0).xy : texelFetch($fwd, q, 0).xy;\
         if (length(o + f.xy) <= 0.5)                                            \
             continue;                                                           \
-        splat_mark[(1 - d) * num + q.y * size.x + q.x] = ${uint: stamp};        \
+        splat_stamp(1 - d, q, o, ${uint: stamp});                               \
         ivec2 r = ivec2(floor(vec2(q) + o + 0.5));                              \
         if (any(lessThan(r, ivec2(0))) || any(greaterThanEqual(r, size)))       \
             continue;                                                           \
         vec2 fr = d == 0 ? texelFetch($fwd, r, 0).xy : texelFetch($bwd, r, 0).xy;\
         if (length(fr + o) < 0.5)                                               \
-            splat_mark[d * num + r.y * size.x + r.x] = ${uint: stamp};          \
+            splat_stamp(d, r, fr, ${uint: stamp});                              \
     }
     // clang-format on
     if (!pl_dispatch_compute(dp, pl_dispatch_compute_params(
@@ -2119,6 +2189,7 @@ static bool splat_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
         return false;
 
     sh = pl_dispatch_begin(dp);
+    const int xconf = dc_env("X_CONF", 1);
     sh_describe(sh, "splat source packing");
     sh->output = PL_SHADER_SIG_NONE;
     if (!sh_try_compute(sh, 16, 16, false, 0)) {
@@ -2151,7 +2222,7 @@ static bool splat_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
             float vis = 0.0;                                                    \
             if (inside)                                                         \
                 vis = d == 0 ? texelFetch($bwd, q, 0).z : texelFetch($fwd, q, 0).z;\
-            hidden = vis >= 0.5;                                                \
+            hidden = vis >= 0.5 || ${const int: xconf} == 0;                    \
             if (hidden) {                                                       \
                 cost = ${const uint: MOTION_SPLAT_COST_HIDDEN};                 \
             } else if (inside) {                                                \
@@ -2438,6 +2509,22 @@ static bool estimate_global(pl_gpu gpu, pl_dispatch dispatch,
            motion_global_median_pass(gpu, dispatch, obj->global.hist,
                                      flow->params.w * flow->params.h, *global,
                                      dir);
+}
+
+// Stage B after the per pixel selection: occlusion, then fill
+static bool motion_b_post(pl_gpu gpu, pl_dispatch dispatch,
+                          struct sh_motion_obj *obj, pl_tex luma_a, pl_tex luma_b)
+{
+    pl_tex luma[2] = { luma_a, luma_b };
+    pl_tex dense[2] = { obj->flow.dense_fwd, obj->flow.dense_bwd };
+    for (int d = 0; d < 2; d++) {
+        if (!motion_occlusion_pass(gpu, dispatch, luma[d], obj->b_sel[d],
+                                   obj->b_sel[!d], obj->b_occ[d]) ||
+            !motion_fill_pass(gpu, dispatch, luma[d], luma[!d], obj->b_occ[d],
+                              dense[d]))
+            return false;
+    }
+    return true;
 }
 
 bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
@@ -2743,21 +2830,9 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
     if (!ok)
         goto error;
 
-    if (bmode) {
-        pl_tex luma[2] = { obj->pyramid_prev.elem[0], obj->scratch.levels.elem[0] };
-        pl_tex dense[2] = { obj->flow.dense_fwd, obj->flow.dense_bwd };
-        for (int d = 0; d < 2; d++) {
-            if (!motion_occlusion_pass(gpu, input->dispatch, luma[d],
-                                       obj->b_sel[d], obj->b_sel[!d],
-                                       obj->b_occ[d]))
-                goto error;
-        }
-        for (int d = 0; d < 2; d++) {
-            if (!motion_fill_pass(gpu, input->dispatch, luma[d], luma[!d],
-                                  obj->b_occ[d], dense[d]))
-                goto error;
-        }
-    }
+    if (bmode && !motion_b_post(gpu, input->dispatch, obj, obj->pyramid_prev.elem[0],
+                                obj->scratch.levels.elem[0]))
+        goto error;
 
     obj->flow.valid = input->direction;
     obj->global.valid = input->estimate_global;
@@ -3294,6 +3369,12 @@ static bool frame_interp_splat(pl_shader sh,
     sh_describe(sh, "frame interpolation (splat)");
 
     const bool tap5 = true;
+    const int hole = dc_env("X_HOLE", 1);
+    const int blur = dc_env("X_BLUR", 2), bstride = dc_env("X_BSTRIDE", 1);
+    const unsigned blurt = dc_env("X_BLURT", 128);
+    const int blurh = dc_env("X_BLURH", 1), blurc = dc_env("X_BLURC", 1);
+    const bool holechk = dc_env("X_HOLECHK", 0);
+    const float softvis = b_envf("X_SOFTVIS", MOTION_SPLAT_SIMILAR);
     ident_t tex[2], pos[2], pt[2], cubic[2];
     for (int i = 0; i < 2; i++) {
         pl_tex tx = frames[i]->tex;
@@ -3377,14 +3458,20 @@ static bool frame_interp_splat(pl_shader sh,
         /* Nothing landed here: borrow from the neighbour furthest back, */     \
         /* which is what gets uncovered between diverging layers */             \
         uint best = 0u;                                                         \
-        for (int i = 0; i < 9; i++) {                                           \
-            ivec2 np = clamp(px + ivec2(i % 3, i / 3) - 1, ivec2(0), size - 1); \
+        for (int r = 1; r <= ${const int: hole} && best == 0u; r++) {           \
+        for (int dy = -r; dy <= r; dy++) {                                      \
+        for (int dx = -r; dx <= r; dx++) {                                      \
+            if (max(abs(dx), abs(dy)) != r)                                     \
+                continue;                                                       \
+            ivec2 np = clamp(px + ivec2(dx, dy), ivec2(0), size - 1);           \
             uint nk = splat_key[np.y * size.x + np.x];                          \
             uint score = nk == ${const uint: SPLAT_EMPTY} ? 0u : nk ^ 0x3FFFFFFFu;\
             if (score > best) {                                                 \
                 best = score;                                                   \
                 from = np;                                                      \
             }                                                                   \
+        }                                                                       \
+        }                                                                       \
         }                                                                       \
         if (best != 0u)                                                         \
             key = best ^ 0x3FFFFFFFu;                                           \
@@ -3400,20 +3487,85 @@ static bool frame_interp_splat(pl_shader sh,
         /* Visibility in a and b; the source frame is always visible */         \
         float other = (key & ${const uint: SPLAT_HIDDEN}) != 0u ? 0.0 : 1.0;    \
         vec2 vis = d == 0 ? vec2(1.0, other) : vec2(other, 1.0);                \
-        vec2 qa = pa - t * f * ${pt[0]};                                        \
-        vec2 qb = pb + (1.0 - t) * f * ${pt[1]};                                \
+        vec2 to_a = -t * f, to_b = (1.0 - t) * f;                               \
+        @if (holechk) {                                                         \
+        if (from != px) {                                                       \
+            /* borrowed vector: per side, look for a pixel moving with it at */ \
+            /* or next to its endpoint, and sample there */                     \
+            ivec2 ia = ivec2(floor(vec2(px) + to_a + 0.5));                     \
+            ivec2 ib = ivec2(floor(vec2(px) + to_b + 0.5));                     \
+            vec2 sa = vec2(0.0), sb = vec2(0.0);                                \
+            vis = vec2(0.0);                                                    \
+            other = 1.0;                                                        \
+            for (int i = 0; i < 9; i++) {                                       \
+                /* centre first */                                              \
+                int j = i == 0 ? 4 : i <= 4 ? i - 1 : i;                        \
+                ivec2 o = ivec2(j % 3, j / 3) - 1;                              \
+                ivec2 qa2 = clamp(ia + o, ivec2(0), size - 1);                  \
+                ivec2 qb2 = clamp(ib + o, ivec2(0), size - 1);                  \
+                vec2 fa = unpackHalf2x16(splat_src[qa2.y * size.x + qa2.x].x);  \
+                vec2 fb = unpackHalf2x16(splat_src[(size.y + qb2.y) * size.x + qb2.x].x);\
+                if (vis.x == 0.0 && length(fa - f) < 1.0) {                     \
+                    vis.x = 1.0; sa = vec2(o);                                  \
+                }                                                               \
+                if (vis.y == 0.0 && length(fb + f) < 1.0) {                     \
+                    vis.y = 1.0; sb = vec2(o);                                  \
+                }                                                               \
+            }                                                                   \
+            to_a += sa; to_b += sb;                                             \
+        }                                                                       \
+        @}                                                                      \
+        vec2 qa = pa + to_a * ${pt[0]};                                         \
+        vec2 qb = pb + to_b * ${pt[1]};                                         \
         vec2 inside = vec2(splat_inside(qa), splat_inside(qb));                 \
         if (dot(vis, inside) > 0.0) {                                           \
             vec4 ca = ${cubic[0]}(qa), cb = ${cubic[1]}(qb);                    \
+            @if (softvis > 0.0) {                                               \
             if (other == 0.0 && inside.x * inside.y > 0.0) {                    \
                 /* The hidden side still counts if it shows the same */         \
                 float e = (splat_luma(ca) - splat_luma(cb))                     \
-                        / ${const float: MOTION_SPLAT_SIMILAR};                 \
+                        / ${const float: softvis};                              \
                 vis = max(vis, vec2(exp(-e * e)));                              \
             }                                                                   \
+            @}                                                                  \
             vec2 wgt = vec2(1.0 - t, t) * vis * inside;                         \
             color = (wgt.x * ca + wgt.y * cb) / (wgt.x + wgt.y);                \
             done = true;                                                        \
+            @if (blur > 0) {                                                    \
+            /* No trustworthy vector: rather than one arbitrary warp, mix */    \
+            /* the warps the pixels around this one would use here */           \
+            if (((key & ${const uint: SPLAT_HIDDEN}) == 0u && (key >> 21 & 255u) >= ${const uint: blurt}) ||\
+                (${const int: blurc} != 0 && (key & ${const uint: SPLAT_HIDDEN}) != 0u) ||\
+                (${const int: blurh} != 0 && from != px)) {                     \
+                vec4 sum = color;                                               \
+                float num = 1.0;                                                \
+                for (int i = 0; i < ${const int: (2 * blur + 1) * (2 * blur + 1)}; i++) {\
+                    ivec2 o = (ivec2(i % ${const int: 2 * blur + 1}, i / ${const int: 2 * blur + 1}) - ${const int: blur}) * ${const int: bstride};\
+                    if (o == ivec2(0))                                          \
+                        continue;                                               \
+                    ivec2 np = clamp(px + o, ivec2(0), size - 1);               \
+                    uint nk = splat_key[np.y * size.x + np.x];                  \
+                    if (nk == ${const uint: SPLAT_EMPTY})                       \
+                        continue;                                               \
+                    int nd = int(nk >> 20 & 1u);                                \
+                    ivec2 ns = np + ivec2(nk & 1023u, nk >> 10 & 1023u) - 512;  \
+                    vec2 nf = unpackHalf2x16(splat_src[(nd * size.y + ns.y) * size.x + ns.x].x);\
+                    if (nd == 1)                                                \
+                        nf = -nf;                                               \
+                    float no = (nk & ${const uint: SPLAT_HIDDEN}) != 0u ? 0.0 : 1.0;\
+                    vec2 nvis = nd == 0 ? vec2(1.0, no) : vec2(no, 1.0);        \
+                    vec2 na = pa - t * nf * ${pt[0]};                           \
+                    vec2 nb = pb + (1.0 - t) * nf * ${pt[1]};                   \
+                    vec2 nw = vec2(1.0 - t, t) * nvis * vec2(splat_inside(na), splat_inside(nb));\
+                    if (nw.x + nw.y <= 0.0)                                     \
+                        continue;                                               \
+                    sum += (nw.x * ${conv[0]}(textureLod(${tex[0]}, na, 0.0)) + \
+                            nw.y * ${conv[1]}(textureLod(${tex[1]}, nb, 0.0))) / (nw.x + nw.y);\
+                    num += 1.0;                                                 \
+                }                                                               \
+                color = sum / num;                                              \
+            }                                                                   \
+            @}                                                                  \
         }                                                                       \
     }                                                                           \
                                                                                 \

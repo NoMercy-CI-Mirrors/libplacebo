@@ -171,6 +171,8 @@ PL_API pl_tex pl_motion_get_flow(pl_shader_obj state,
 PL_API pl_tex pl_motion_debug_raw(pl_shader_obj state, int dir);
 PL_API pl_tex pl_motion_debug_fine(pl_shader_obj state, int dir);
 
+PL_API pl_tex pl_motion_debug_get_sel(pl_shader_obj state, int dir);
+PL_API bool pl_motion_debug_redo_b(pl_shader_obj state, pl_dispatch dp);
 // EXPERIMENT: overwrite the flow of `dir` (rgba16f, size of the flow texture).
 PL_API bool pl_motion_debug_set_flow(pl_shader_obj state,
                                      enum pl_motion_direction dir,
