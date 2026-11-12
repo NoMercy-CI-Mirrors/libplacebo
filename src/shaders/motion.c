@@ -121,6 +121,8 @@ struct sh_motion_obj {
 
     struct pl_motion_estimate_params params;
     int w, h;
+    pl_tex raw_dbg[2];
+    pl_tex fine_raw[4], fine[2][4];
 };
 
 // Binds `tex` for use with `texelFetch`.
@@ -169,7 +171,7 @@ static void bind_buf(pl_shader sh, const char *name, pl_buf buf,
 }
 
 // Don't reduce image pyramid to a size that is too small to recover motion.
-#define MIN_COARSE_BLOCKS 8
+#define MIN_COARSE_BLOCKS 3
 
 // "Block" will be used to refer to a block of pixels that we group together
 // for the motion search.
@@ -305,7 +307,7 @@ motion_compute_shmem_layout(int block_size, int radius, int bpgx, int bpgy,
     const size_t words =
         (size_t) blocks * PL_SQUARE(block_size) // reference tile
         + (size_t) blocks * block_stride        // search windows
-        + 2 * (size_t) blocks                   // cost and rank
+        + 3 * (size_t) blocks                   // cost, rank and cost sum
         + 2 * (size_t) blocks                   // seed
         + (subpixel ? 4 : 0) * (size_t) blocks  // cost around the winner
         + score;                                // seed candidate scores
@@ -552,7 +554,7 @@ static bool flow_pyramid_recreate(pl_gpu gpu, void *alloc,
         bool ok = pl_tex_recreate(
             gpu, &pyramid->elem[i],
             pl_tex_params(.w = grid_w, .h = grid_h, .format = fmt,
-                          .sampleable = true, .storable = true,
+                          .sampleable = true, .storable = true, .host_readable = true,
                           .debug_tag = PL_DEBUG_TAG, ));
 
         if (!ok) {
@@ -677,6 +679,13 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
     }
     pl_tex_destroy(gpu, &obj->dc_depth[0]);
     pl_tex_destroy(gpu, &obj->dc_depth[1]);
+    pl_tex_destroy(gpu, &obj->raw_dbg[0]);
+    pl_tex_destroy(gpu, &obj->raw_dbg[1]);
+    for (int i = 0; i < 4; i++) {
+        pl_tex_destroy(gpu, &obj->fine_raw[i]);
+        pl_tex_destroy(gpu, &obj->fine[0][i]);
+        pl_tex_destroy(gpu, &obj->fine[1][i]);
+    }
     pl_buf_destroy(gpu, &obj->global.fwd);
     pl_buf_destroy(gpu, &obj->global.bwd);
     pl_buf_destroy(gpu, &obj->global.hist);
@@ -1494,6 +1503,21 @@ bool pl_motion_debug_splat(pl_shader_obj state, pl_dispatch dp, pl_tex a, pl_tex
     return true;
 }
 
+pl_tex pl_motion_debug_fine(pl_shader_obj state, int dir)
+{
+    struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
+                                              struct sh_motion_obj);
+    int n = getenv("FINE") ? atoi(getenv("FINE")) : 0;
+    return obj && n > 0 ? obj->fine[dir][n] : NULL;
+}
+
+pl_tex pl_motion_debug_raw(pl_shader_obj state, int dir)
+{
+    struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
+                                              struct sh_motion_obj);
+    return obj ? obj->raw_dbg[dir] : NULL;
+}
+
 ident_t sh_motion_flow(pl_shader sh, pl_shader_obj state,
                        enum pl_motion_direction dir)
 {
@@ -1726,6 +1750,7 @@ struct motion_search {
                    // or NULL when there is none available
     pl_tex out_mv;                      // block granular flow field
     const struct motion_geometry *geom; // compile time constants
+    int parent_scale;                   // EXPERIMENT: 0 = 2
     pl_shader_obj *cand_lut;
 };
 
@@ -1734,6 +1759,14 @@ struct motion_search {
 // Uses the sum of squared distances (SSD) to compute the most likely
 // motion vector that describes the motion of a block of pixels from one
 // frame to the next.
+//
+// Also stores the distinctiveness of that match, i.e. how much lower the SSD
+// of the winning candidate is than the average SSD of the search window:
+//
+//     q = 1 - (SSD_min + noise) / (SSD_mean + noise)
+//
+// This is 0 for a block that matches every candidate equally well, e.g. for
+// lack of texture, and independent of the contrast of the source.
 static bool motion_search_pass(pl_gpu gpu, pl_dispatch dispatch,
                                const struct motion_search *p)
 {
@@ -1747,6 +1780,18 @@ static bool motion_search_pass(pl_gpu gpu, pl_dispatch dispatch,
     const int ncand   = PL_SQUARE(2 * r + 1);
     const int nseed = geom->seeds.num;
     const bool subpixel = geom->subpixel;
+
+    // Drop as many low bits of each SSD as needed for the sum of the SSD of
+    // every candidate to fit into a uint. Zero as long as (2r+1) * bs <= 257.
+    const uint64_t max_ssd = (uint64_t) PL_SQUARE(bs) * 255 * 255;
+    int cost_shift = 0;
+    while ((ncand * max_ssd) >> cost_shift > UINT32_MAX)
+        cost_shift++;
+
+    // SSD below which a match is indistinguishable from quantization noise,
+    // i.e. a variance of 1/4 per pixel (the difference of two luma values
+    // rounded to 8 bits has a variance of 1/6).
+    const float cost_noise = PL_SQUARE(bs) / 4.0f / (1 << cost_shift);
 
     // Total size of tile.
     const int ref_w = bpgx * bs, ref_h = bpgy * bs;
@@ -1810,6 +1855,7 @@ static bool motion_search_pass(pl_gpu gpu, pl_dispatch dispatch,
     const bool has_parent = p->parent != NULL;
     const int parent_w = has_parent ? p->parent->params.w : 0;
     const int parent_h = has_parent ? p->parent->params.h : 0;
+    const int pscale = p->parent_scale ? p->parent_scale : 2;
     const int rank_parent = geom->seeds.rank[MOTION_SEED_PARENT];
     const int rank_x = geom->seeds.rank[MOTION_SEED_PARENT_X];
     const int rank_y = geom->seeds.rank[MOTION_SEED_PARENT_Y];
@@ -1850,6 +1896,8 @@ static bool motion_search_pass(pl_gpu gpu, pl_dispatch dispatch,
          * then on y. */                                                        \
         shared uint near_cost[${const int: 4 * bpg}];                           \
     @}                                                                          \
+    /* Sum of the cost of all candidates for each block. */                     \
+    shared uint cost_sum[${const int: bpg}];                                    \
     /* Displacement into the target image that each block's search window will  \
      * be centered upon or seeded with. */                                      \
     shared ivec2 s_seed[${const int: bpg}];                                     \
@@ -1875,7 +1923,7 @@ static bool motion_search_pass(pl_gpu gpu, pl_dispatch dispatch,
                                   ${const int: parent_h}) - 1);                 \
             /* Multiply by two to account for change in scale between pyramid   \
              * levels. */                                                       \
-            return 2 * ivec2(texelFetch($parent, p, 0).xy);                     \
+            return ${const int: pscale} * ivec2(texelFetch($parent, p, 0).xy);  \
         }                                                                       \
     @}                                                                          \
                                                                                 \
@@ -1974,6 +2022,7 @@ static bool motion_search_pass(pl_gpu gpu, pl_dispatch dispatch,
     if (tid < ${const uint: bpg}) {                                             \
         best_cost[tid] = 0xFFFFFFFFu;                                           \
         best_rank[tid] = 0xFFFFFFFFu;                                           \
+        cost_sum[tid]  = 0u;                                                    \
     }                                                                           \
                                                                                 \
     /* Load block from reference image into shared memory. We clamp coordinates \
@@ -2050,7 +2099,7 @@ static bool motion_search_pass(pl_gpu gpu, pl_dispatch dispatch,
                                                                                 \
     /* Compute the sum of squared differences (SSD) of all candidates of each   \
      * block. One thread loads all elements of a given candidate. */            \
-    uint best = 0xFFFFFFFFu, rank = 0xFFFFFFFFu;                                \
+    uint best = 0xFFFFFFFFu, rank = 0xFFFFFFFFu, sum = 0u;                      \
     for (int c = c0; c < ${const int: ncand}; c += ${const int: tpb}) {         \
         ivec2 cand_offset = $cand(c);                                           \
         /* Change the candidate offset into coordinates within the window */    \
@@ -2062,10 +2111,12 @@ static bool motion_search_pass(pl_gpu gpu, pl_dispatch dispatch,
             best = ssd;                                                         \
             rank = uint(c);                                                     \
         }                                                                       \
+        sum += ssd >> ${const int: cost_shift};                                 \
     }                                                                           \
                                                                                 \
     /* Reduce over SSD cost. */                                                 \
     atomicMin(best_cost[b], best);                                              \
+    atomicAdd(cost_sum[b], sum);                                                \
     barrier();                                                                  \
     /* Reduce over rank for deterministic minimum */                            \
     if (best == best_cost[b])                                                   \
@@ -2088,6 +2139,15 @@ static bool motion_search_pass(pl_gpu gpu, pl_dispatch dispatch,
     if (c0 == 0 && blk.x < ${const int: grid_w} &&                              \
         blk.y < ${const int: grid_h})                                           \
     {                                                                           \
+        /* A single candidate has no SSD surface to judge. */                   \
+        float q = 1.0;                                                          \
+        @if (ncand > 1) {                                                       \
+            float cost_min  = float(best_cost[b] >> ${const int: cost_shift});  \
+            float cost_mean = float(cost_sum[b]) / float(${const int: ncand});  \
+            q = 1.0 - (cost_min + ${const float: cost_noise})                   \
+                    / (cost_mean + ${const float: cost_noise});                 \
+            q = clamp(q, 0.0, 1.0);                                             \
+        @}                                                                      \
         vec2 mv = vec2(seed + winner);                                          \
         @if (subpixel) {                                                        \
             /* Move to the vertex of the parabola through the cost of the       \
@@ -2100,7 +2160,7 @@ static bool motion_search_pass(pl_gpu gpu, pl_dispatch dispatch,
             vec2 off = 0.5 * (prev - next) / max(curv, vec2(1.0));              \
             mv += clamp(off, vec2(-0.5), vec2(0.5));                            \
         @}                                                                      \
-        imageStore($out, blk, vec4(mv, 1.0, 0.0));                              \
+        imageStore($out, blk, vec4(mv, q, 0.0));                                \
     }
     // clang-format on
 
@@ -2118,38 +2178,87 @@ error:
     return false;
 }
 
+// EXPERIMENT: configurable smoothing, see /z/ai/claude/2026-11-12-residency.
+// Env SMOOTH (all levels) / SMOOTH0 (level 0 override):
+//   "<fallback>[,q=T][,novel=T]", fallback = median | fill | none.
+// The own vector is kept if q >= T, or if its novelty
+//   sum max(0, c - e_own) / (sum c + noise), c = min over the 8 neighbours,
+// is >= T; otherwise the fallback is taken.
+enum smooth_fb { SMOOTH_MEDIAN, SMOOTH_FILL, SMOOTH_NONE };
+struct smooth_cfg { int fb; float qt, nt; int r; bool self; int sup; float coh, ot; };
+
+static struct smooth_cfg smooth_cfg(bool level0)
+{
+    struct smooth_cfg c = { SMOOTH_FILL, -1, -1, 1, false, 0, 0, -1 };
+    const char *s = level0 && getenv("SMOOTH0") ? getenv("SMOOTH0") : getenv("SMOOTH");
+    if (!s)
+        return c;
+    if (!strncmp(s, "median", 6))
+        c.fb = SMOOTH_MEDIAN;
+    else if (!strncmp(s, "none", 4))
+        c.fb = SMOOTH_NONE;
+    const char *p;
+    if ((p = strstr(s, "q=")))
+        c.qt = atof(p + 2);
+    if ((p = strstr(s, "novel=")))
+        c.nt = atof(p + 6);
+    if ((p = strstr(s, "r=")))
+        c.r = atoi(p + 2);
+    c.self = strstr(s, "self");
+    if ((p = strstr(s, "sup=")))
+        c.sup = atoi(p + 4);
+    if ((p = strstr(s, "coh=")))
+        c.coh = atof(p + 4);
+    if ((p = strstr(s, "occ=")))
+        c.ot = atof(p + 4);
+    return c;
+}
+
 // Replace every block's motion vector with one derived from the surrounding 3x3
 // neighbourhood of blocks, to suppress vectors that the search got wrong.
 static bool motion_smooth_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
-                               pl_tex ref, pl_tex tgt, pl_tex in, pl_tex out)
+                               pl_tex ref, pl_tex tgt, pl_tex in, pl_tex out,
+                               bool level0, pl_tex raw_dbg)
 {
     const int grid_w = out->params.w, grid_h = out->params.h;
     const int tex_w = ref->params.w, tex_h = ref->params.h;
+    const struct smooth_cfg cfg = smooth_cfg(level0);
+    const int fb = cfg.fb;
+    const bool use_q = cfg.qt >= 0, use_nov = cfg.nt >= 0;
+    const float qt = cfg.qt, nt = cfg.nt;
+    const int r = cfg.r, nd = 2 * r + 1, nc = nd * nd, own_i = nc / 2;
+    const bool self = cfg.self;
+    const int skip_i = self ? -1 : own_i;
+    const int sup = cfg.sup;
+    // Penalty per px^2 of distance to the 3x3 median, capped at 4 px, in units
+    // of a block SSD of one code value per pixel
+    const float coh = cfg.coh * bs * bs / (255.0f * 255.0f);
+    const bool use_coh = cfg.coh > 0;
+    const bool use_occ = cfg.ot >= 0;
+    const float ot = cfg.ot;
+    const float noise = bs * bs * (0.5f / 255) * (0.5f / 255);
 
     // A work group covers `gx` x `gy` blocks, with one thread per row
     const int gx = PL_CLAMP(64 / bs, 1, 8), gy = 4;
     const int bw = gx * bs, bh = gy;
-    const size_t shmem = bw * bh * 8 * sizeof(float);
+    const int ns = nc + 4;
+    const size_t shmem = bw * bh * ns * sizeof(float);
 
     pl_shader sh = pl_dispatch_begin(dispatch);
-    sh_describef(sh, "motion vector smoothing (3x3, %dx%d blocks)", grid_w,
-                 grid_h);
+    sh_describef(sh, "motion vector smoothing (%dx%d, %dx%d blocks, fb %d q %.2f nov %.2f self %d)",
+                 nd, nd, grid_w, grid_h, fb, qt, nt, self);
     sh->output = PL_SHADER_SIG_NONE;
 
     if (!sh_try_compute(sh, bw, bh, false, shmem)) {
-        PL_ERR(gpu,
-               "pl_motion_estimate: cannot create motion vector smoothing "
-               "shader, needs %dx%d threads and %zu bytes of shared memory per "
-               "work group!",
-               bw, bh, shmem);
+        PL_ERR(gpu, "pl_motion_estimate: cannot create smoothing shader");
         goto error;
     }
 
     ident_t src = bind_tex(sh, "flow_in", in);
     ident_t dst = bind_img(sh, "flow_out", out);
+    const bool has_dbg = raw_dbg;
+    ident_t dbg = has_dbg ? bind_img(sh, "raw_dbg", raw_dbg) : NULL_IDENT;
     ident_t ref_id = bind_tex(sh, "ref", ref);
-
-    // The vectors are fractional
     ident_t tgt_pt, tgt_id = sh_bind(sh, tgt, PL_TEX_ADDRESS_CLAMP,
                                      PL_TEX_SAMPLE_LINEAR, "tgt", NULL, NULL,
                                      &tgt_pt);
@@ -2158,8 +2267,23 @@ static bool motion_smooth_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
 
     // clang-format off
 #pragma GLSLH /* motion_smooth_pass */                                          \
-    /* SSD of each neighbour over each row of each block of the group. */       \
-    shared float s_ssd[${const int: bw * bh * 8}];
+    shared float s_ssd[${const int: bw * bh * ns}];                             \
+    void sort2(inout vec2 a, inout vec2 b) {                                    \
+        vec2 lo = min(a, b);                                                    \
+        b = max(a, b);                                                          \
+        a = lo;                                                                 \
+    }                                                                           \
+    void sort9(inout vec2 a, inout vec2 b, inout vec2 c, inout vec2 d,          \
+               inout vec2 e, inout vec2 f, inout vec2 g, inout vec2 h,          \
+               inout vec2 i) {                                                  \
+        sort2(c,f); sort2(a,d); sort2(e,i); sort2(b,h);                         \
+        sort2(a,h); sort2(c,e); sort2(f,g); sort2(d,i);                         \
+        sort2(a,c); sort2(b,d); sort2(e,f); sort2(h,i);                         \
+        sort2(b,e); sort2(f,h); sort2(d,g);                                     \
+        sort2(c,e); sort2(a,b); sort2(d,f); sort2(g,i);                         \
+        sort2(c,d); sort2(e,f); sort2(g,h);                                     \
+        sort2(b,c); sort2(d,e); sort2(f,g);                                     \
+    }
     // clang-format on
 
     // clang-format off
@@ -2171,57 +2295,112 @@ static bool motion_smooth_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     ivec2 blk  = ivec2(gl_WorkGroupID.xy) *                                     \
                  ivec2(${const int: gx}, ${const int: gy}) +                    \
                  ivec2(tid.x / ${const int: bs}, tid.y);                        \
-    int base   = (tid.y * ${const int: bw} + tid.x) * 8;                        \
+    int base   = (tid.y * ${const int: bw} + tid.x) * ${const int: ns};         \
                                                                                 \
-    /* The 3x3 neighbourhood around this block, clamped. */                     \
-    vec2 mv[9];                                                                 \
-    for (int i = 0; i < 9; i++) {                                               \
-        ivec2 p = clamp(blk + ivec2(i % 3, i / 3) - 1, ivec2(0), grid - 1);     \
+    vec2 mv[${const int: nc}];                                                  \
+    for (int i = 0; i < ${const int: nc}; i++) {                                \
+        ivec2 o = ivec2(i % ${const int: nd}, i / ${const int: nd}) - ${const int: r}; \
+        ivec2 p = clamp(blk + o, ivec2(0), grid - 1);                           \
         mv[i] = texelFetch($src, p, 0).xy;                                      \
     }                                                                           \
                                                                                 \
-    /* Take the vector of the neighbour that matches the block best. Every      \
-     * thread matches its own row of the block against the vectors of the 8     \
-     * neighbours. The block's own vector is left out: the search already       \
-     * preferred it over every vector it tried, usually including those of      \
-     * the neighbours, so it would win exactly where its match is               \
-     * ambiguous. */                                                            \
-    float ssd[8];                                                               \
-    for (int k = 0; k < 8; k++)                                                 \
+    float ssd[${const int: nc}];                                                \
+    for (int k = 0; k < ${const int: nc}; k++)                                  \
         ssd[k] = 0.0;                                                           \
+    float gain = 0.0, csum = 0.0, rs = 0.0, rs2 = 0.0;                          \
     for (int j = 0; j < ${const int: bs}; j++) {                                \
         ivec2 pos = min(blk * ${const int: bs} + ivec2(j, row), size - 1);      \
         float r = texelFetch($ref_id, pos, 0).r;                                \
+        rs += r;                                                                \
+        rs2 += r * r;                                                           \
         vec2 c = vec2(pos) + vec2(0.5);                                         \
-        for (int k = 0; k < 8; k++) {                                           \
-            vec2 v = mv[k < 4 ? k : k + 1].xy;                                  \
-            float d = r - textureLod($tgt_id, (c + v) * $tgt_pt, 0.0).r;        \
+        float cmin = 1e30, eown = 0.0;                                          \
+        for (int k = 0; k < ${const int: nc}; k++) {                            \
+            float d = r - textureLod($tgt_id, (c + mv[k]) * $tgt_pt, 0.0).r;    \
             ssd[k] += d * d;                                                    \
+            ivec2 o = ivec2(k % ${const int: nd}, k / ${const int: nd}) - ${const int: r}; \
+            if (k == ${const int: own_i})                                       \
+                eown = d * d;                                                   \
+            else if (all(lessThanEqual(abs(o), ivec2(1))))                      \
+                cmin = min(cmin, d * d);                                        \
         }                                                                       \
+        gain += max(0.0, cmin - eown);                                          \
+        csum += cmin;                                                           \
     }                                                                           \
-    for (int k = 0; k < 8; k++)                                                 \
+    for (int k = 0; k < ${const int: nc}; k++)                                  \
         s_ssd[base + k] = ssd[k];                                               \
+    s_ssd[base + ${const int: nc}] = gain;                                      \
+    s_ssd[base + ${const int: nc + 1}] = csum;                                  \
+    s_ssd[base + ${const int: nc + 2}] = rs;                                    \
+    s_ssd[base + ${const int: nc + 3}] = rs2;                                   \
     barrier();                                                                  \
                                                                                 \
     if (all(lessThan(blk, grid)) && row == 0) {                                 \
-        /* Without any neighbour inside the grid, keep the block's vector. */   \
-        vec2 best = mv[4].xy;                                                   \
-        float best_ssd = 1e30;                                                  \
-        for (int k = 0; k < 8; k++) {                                           \
-            int i = k < 4 ? k : k + 1;                                          \
-            ivec2 p = blk + ivec2(i % 3, i / 3) - 1;                            \
-            float sum = 0.0;                                                    \
-            for (int j = 0; j < ${const int: bs}; j++)                          \
-                sum += s_ssd[base + j * 8 + k];                                 \
-            bool inside = all(equal(p, clamp(p, ivec2(0), grid - 1)));          \
-            if (inside && sum < best_ssd) {                                     \
-                best = mv[i].xy;                                                \
-                best_ssd = sum;                                                 \
+        vec4 own = texelFetch($src, blk, 0);                                    \
+        @if (has_dbg)                                                           \
+            imageStore($dbg, blk, own);                                         \
+        vec2 res = own.xy;                                                      \
+        vec2 m[9];                                                              \
+        for (int i = 0; i < 9; i++)                                             \
+            m[i] = texelFetch($src, clamp(blk + ivec2(i % 3, i / 3) - 1,        \
+                                          ivec2(0), grid - 1), 0).xy;           \
+        sort9(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]);            \
+        @if (fb == SMOOTH_MEDIAN)                                               \
+            res = m[4];                                                         \
+        @if (fb == SMOOTH_FILL) {                                               \
+            float best_ssd = 1e30;                                              \
+            for (int i = 0; i < ${const int: nc}; i++) {                        \
+                ivec2 p = blk + ivec2(i % ${const int: nd}, i / ${const int: nd}) - ${const int: r}; \
+                float sum = 0.0;                                                \
+                for (int j = 0; j < ${const int: bs}; j++)                      \
+                    sum += s_ssd[base + j * ${const int: ns} + i];              \
+                bool inside = all(equal(p, clamp(p, ivec2(0), grid - 1)));      \
+                bool skip = i == ${const int: skip_i};                          \
+                @if (use_coh) {                                                 \
+                    vec2 dm = mv[i] - m[4];                                     \
+                    sum += ${const float: coh} * min(dot(dm, dm), 16.0);        \
+                @}                                                              \
+                if (inside && !skip && sum < best_ssd) {                        \
+                    res = mv[i];                                                \
+                    best_ssd = sum;                                             \
+                }                                                               \
             }                                                                   \
-        }                                                                       \
-                                                                                \
-        /* The confidence is always 1. */                                       \
-        imageStore($dst, blk, vec4(best, 1.0, 0.0));                            \
+            @if (use_occ) {                                                     \
+                float t1 = 0.0, t2 = 0.0;                                       \
+                for (int j = 0; j < ${const int: bs}; j++) {                    \
+                    t1 += s_ssd[base + j * ${const int: ns} + ${const int: nc + 2}]; \
+                    t2 += s_ssd[base + j * ${const int: ns} + ${const int: nc + 3}]; \
+                }                                                               \
+                float energy = t2 - t1 * t1 / ${const float: bs * bs};          \
+                if (best_ssd > ${const float: ot} * (energy + ${const float: noise})) \
+                    res = m[4];                                                 \
+            @}                                                                  \
+        @}                                                                      \
+        bool keep = false;                                                      \
+        @if (use_q)                                                             \
+            keep = keep || own.z >= ${const float: qt};                         \
+        @if (use_nov) {                                                         \
+            float g = 0.0, cs = 0.0;                                            \
+            for (int j = 0; j < ${const int: bs}; j++) {                        \
+                g  += s_ssd[base + j * ${const int: ns} + ${const int: nc}];    \
+                cs += s_ssd[base + j * ${const int: ns} + ${const int: nc + 1}]; \
+            }                                                                   \
+            keep = keep || g / (cs + ${const float: noise}) >= ${const float: nt}; \
+        @}                                                                      \
+        @if (sup > 0) {                                                         \
+            int n_sup = 0;                                                      \
+            for (int i = 0; i < 9; i++) {                                       \
+                ivec2 p = blk + ivec2(i % 3, i / 3) - 1;                        \
+                bool inside = all(equal(p, clamp(p, ivec2(0), grid - 1)));      \
+                vec2 dv = texelFetch($src, clamp(p, ivec2(0), grid - 1), 0).xy - own.xy; \
+                if (i != 4 && inside && dot(dv, dv) <= 1.0)                     \
+                    n_sup++;                                                    \
+            }                                                                   \
+            keep = keep || n_sup >= ${const int: sup};                          \
+        @}                                                                      \
+        if (keep)                                                               \
+            res = own.xy;                                                       \
+        imageStore($dst, blk, vec4(res, 1.0, 0.0));                             \
     }
     // clang-format on
 
@@ -2989,12 +3168,12 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
             // corresponding level of the motion search pyramid from the
             // previous frame pair that the motion estimation was invoked
             // upon.
-            pl_tex prior = has_prior ? field->elem[i] : NULL;
+            pl_tex prior = has_prior && !getenv("A_NOPRIOR") ? field->elem[i] : NULL;
 
             struct motion_geometry geom;
             ok = motion_plan(gpu, tmp, params->block_size, radius,
                              motion_seeds_plan(parent != NULL, prior != NULL),
-                             i == 0, out->params.w, out->params.h, &geom);
+                             i == 0 && !getenv("A_NOSUB"), out->params.w, out->params.h, &geom);
             if (!ok)
                 break;
 
@@ -3012,8 +3191,15 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
             if (!ok)
                 break;
 
+            const int nfine = getenv("FINE") ? atoi(getenv("FINE")) : 0;
+            pl_tex dbg = NULL;
+            if (i == 0 && !nfine) {
+                pl_tex_recreate(gpu, &obj->raw_dbg[d], &raw->params);
+                dbg = obj->raw_dbg[d];
+            }
             ok = motion_smooth_pass(gpu, input->dispatch, params->block_size,
-                                    fwd ? a : b, fwd ? b : a, raw, out);
+                                    fwd ? a : b, fwd ? b : a, raw, out,
+                                    i == 0, dbg);
             if (!ok)
                 break;
         }
@@ -3021,12 +3207,52 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
         if (!ok)
             break;
 
-        ok = motion_refine_pass(gpu, input->dispatch, params->block_size,
+        // EXPERIMENT: extra full resolution stages with half the block size
+        const int nfine = getenv("FINE") ? atoi(getenv("FINE")) : 0;
+        pl_tex prev = obj->scratch.filtered.elem[0];
+        for (int s = 1; ok && s <= nfine && s < 4; s++) {
+            const int fbs = params->block_size >> s;
+            pl_tex a = obj->pyramid_prev.elem[0];
+            pl_tex b = obj->scratch.levels.elem[0];
+            struct pl_tex_params tp = prev->params;
+            tp.w = PL_DIV_UP(a->params.w, fbs);
+            tp.h = PL_DIV_UP(a->params.h, fbs);
+            tp.debug_tag = PL_DEBUG_TAG;
+            ok = pl_tex_recreate(gpu, &obj->fine_raw[s], &tp) &&
+                 pl_tex_recreate(gpu, &obj->fine[d][s], &tp);
+            pl_tex dbg = NULL;
+            if (ok && s == nfine) {
+                ok = pl_tex_recreate(gpu, &obj->raw_dbg[d], &tp);
+                dbg = obj->raw_dbg[d];
+            }
+            struct motion_geometry geom;
+            ok = ok && motion_plan(gpu, tmp, fbs, params->search_radius_fine,
+                                   motion_seeds_plan(true, false), true,
+                                   tp.w, tp.h, &geom);
+            if (!ok)
+                break;
+            const struct motion_search search = {
+                .cand_lut = &obj->cand_lut[0],
+                .ref    = fwd ? a : b,
+                .tgt    = fwd ? b : a,
+                .parent = prev,
+                .out_mv = obj->fine_raw[s],
+                .geom   = &geom,
+                .parent_scale = 1,
+            };
+            ok = motion_search_pass(gpu, input->dispatch, &search) &&
+                 motion_smooth_pass(gpu, input->dispatch, fbs, fwd ? a : b,
+                                    fwd ? b : a, obj->fine_raw[s],
+                                    obj->fine[d][s], true, dbg);
+            prev = obj->fine[d][s];
+        }
+        ok = ok && motion_refine_pass(gpu, input->dispatch,
+                                params->block_size >> PL_MIN(nfine, 3),
                                 fwd ? obj->pyramid_prev.elem[0]
                                     : obj->scratch.levels.elem[0],
                                 fwd ? obj->scratch.levels.elem[0]
                                     : obj->pyramid_prev.elem[0],
-                                obj->scratch.filtered.elem[0],
+                                prev,
                                 bmode ? obj->b_sel[d] :
                                 fwd ? obj->flow.dense_fwd : obj->flow.dense_bwd);
         if (!ok)

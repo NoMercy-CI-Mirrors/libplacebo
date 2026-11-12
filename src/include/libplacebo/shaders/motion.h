@@ -58,7 +58,7 @@ struct pl_motion_estimate_params {
 
 #define PL_MOTION_ESTIMATE_DEFAULTS                                            \
     .block_size = 8, .pyramid_levels = 0, .search_radius_coarse = 4,           \
-    .search_radius_fine = 2,
+    .search_radius_fine = 1,
 
 #define pl_motion_estimate_params(...)                                         \
     (&(struct pl_motion_estimate_params) {                                     \
@@ -167,6 +167,9 @@ PL_API void pl_motion_reset(pl_shader_obj state);
 // vector matches badly.
 PL_API pl_tex pl_motion_get_flow(pl_shader_obj state,
                                  enum pl_motion_direction dir);
+// EXPERIMENT: level 0 search output before smoothing, dir 0 fwd / 1 bwd.
+PL_API pl_tex pl_motion_debug_raw(pl_shader_obj state, int dir);
+PL_API pl_tex pl_motion_debug_fine(pl_shader_obj state, int dir);
 
 // EXPERIMENT: overwrite the flow of `dir` (rgba16f, size of the flow texture).
 PL_API bool pl_motion_debug_set_flow(pl_shader_obj state,
