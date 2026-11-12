@@ -87,6 +87,11 @@ struct sh_motion_obj {
     pl_buf dc_mark;
     unsigned dc_pair;
 
+    // EXPERIMENT (stage B): the selected vectors, and those with the occlusion
+    // estimate, of each direction; `b_mode` is whether B ran
+    pl_tex b_sel[2], b_occ[2];
+    int b_mode;
+
     // Dimensions of `flow.fwd.elem[0]` (number of blocks to cover the full
     // resolution).
     int grid_w, grid_h;
@@ -666,6 +671,10 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
     pl_buf_destroy(gpu, &obj->dc_rank);
     pl_buf_destroy(gpu, &obj->dc_key[0]);
     pl_buf_destroy(gpu, &obj->dc_key[1]);
+    for (int i = 0; i < 2; i++) {
+        pl_tex_destroy(gpu, &obj->b_sel[i]);
+        pl_tex_destroy(gpu, &obj->b_occ[i]);
+    }
     pl_tex_destroy(gpu, &obj->dc_depth[0]);
     pl_tex_destroy(gpu, &obj->dc_depth[1]);
     pl_buf_destroy(gpu, &obj->global.fwd);
@@ -1086,7 +1095,7 @@ static bool dc_mark_front(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
     bind_buf(sh, "dc_mark_buf", obj->dc_mark, PL_DESC_ACCESS_WRITEONLY, &vm, 1);
     ident_t ff = bind_tex(sh, "dc_fwd", obj->flow.dense_fwd);
     ident_t fb = bind_tex(sh, "dc_bwd", obj->flow.dense_bwd);
-    const int spread = dc_env("LM_SPLAT_SPREAD", 0);
+    const int spread = dc_env("LM_SPLAT_SPREAD", 2);
     const float tau = getenv("LM_SPLAT_TAU") ? atof(getenv("LM_SPLAT_TAU")) : 0.3f;
     // clang-format off
 #pragma GLSLH /* EXPERIMENT front mark */                                       \
@@ -1156,7 +1165,7 @@ static bool dc_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp,
     const int w = obj->flow.dense_fwd->params.w, h = obj->flow.dense_fwd->params.h;
     const size_t n = (size_t) w * h;
     const int tb = dc_env("LM_SPLAT_TB", 0);
-    const int dmode = dc_env("LM_SPLAT_DEPTH", 0); // 0 flow.w, 1 rank, 2 mark, 3 gather
+    const int dmode = dc_env("LM_SPLAT_DEPTH", 2); // 0 flow.w, 1 rank, 2 mark, 3 gather
     const bool own_depth = dmode == 1;
     if (own_depth && !dc_derive_depth(obj, gpu, dp))
         return false;
@@ -2356,6 +2365,155 @@ error:
     return false;
 }
 
+// EXPERIMENT (stage B): tunables read from the environment
+static float b_envf(const char *name, float def)
+{
+    const char *v = getenv(name);
+    return v ? atof(v) : def;
+}
+
+// Set by `pl_shader_frame_interp`: whether the estimation runs stage B's
+// occlusion and fill passes after the per pixel selection.
+static int motion_b_request;
+
+// Stage B: marks the pixels of `flow` that are hidden in the other frame, in
+// the z channel of `out` (visibility, hidden below 0.5). A pixel is hidden if
+// following its vector and then the opposite field's (`opp`) does not lead
+// back to it, and the content there differs from its own in `ref`.
+static bool motion_occlusion_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
+                                  pl_tex flow, pl_tex opp, pl_tex out)
+{
+    const int w = out->params.w, h = out->params.h;
+    pl_shader sh = pl_dispatch_begin(dispatch);
+    sh_describef(sh, "motion occlusion (%dx%d)", w, h);
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 16, 16, false, 0))
+        goto error;
+
+    ident_t src = bind_tex(sh, "flow_in", flow);
+    ident_t opp_id = bind_tex_linear(sh, "flow_opp", opp);
+    ident_t ref_id = bind_tex_linear(sh, "ref", ref);
+    ident_t dst = bind_img(sh, "flow_out", out);
+    const float fbt = b_envf("LM_B_FBT", 1.0f), ot = b_envf("LM_B_OT", 0.3f);
+    const float noise = 9.0f / (255.0f * 255.0f);
+
+    // clang-format off
+#pragma GLSL /* motion_occlusion_pass */                                        \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 pos  = ivec2(gl_GlobalInvocationID.xy);                               \
+    if (all(lessThan(pos, size))) {                                             \
+        vec2 pt = 1.0 / vec2(size);                                             \
+        vec2 f = texelFetch($src, pos, 0).xy;                                   \
+        vec2 rt = f + textureLod($opp_id, (vec2(pos) + 0.5 + f) * pt, 0.0).xy;  \
+        float vis = 1.0 / (1.0 + dot(rt, rt) / ${const float: fbt * fbt});      \
+        if (vis < 0.5) {                                                        \
+            float centre = texelFetch($ref_id, pos, 0).r;                       \
+            float ssd = 0.0, energy = 0.0;                                      \
+            for (int j = 0; j < 9; j++) {                                       \
+                ivec2 q = clamp(pos + ivec2(j % 3, j / 3) - 1, ivec2(0), size - 1);\
+                float r = texelFetch($ref_id, q, 0).r;                          \
+                float s = textureLod($ref_id, (vec2(q) + 0.5 + rt) * pt, 0.0).r;\
+                ssd += (r - s) * (r - s);                                       \
+                energy += (r - centre) * (r - centre);                          \
+            }                                                                   \
+            float m = ssd / (energy + ${const float: noise}) / ${const float: ot};\
+            vis = max(vis, 1.0 / (1.0 + m * m));                                \
+        }                                                                       \
+        imageStore($dst, pos, vec4(f, vis, 0.0));                               \
+    }
+    // clang-format on
+
+    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+        .shader = &sh,
+        .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(h, 16), 1 }));
+
+error:
+    pl_dispatch_abort(dispatch, &sh);
+    return false;
+}
+
+// Stage B: matching cannot find the vector of a hidden pixel. Give it the
+// vector, among those of the blocks around it (`blocks`), that most nearby
+// visible pixels of similar brightness move with.
+static bool motion_fill_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
+                             pl_tex ref, pl_tex blocks, pl_tex flow, pl_tex out)
+{
+    const int w = out->params.w, h = out->params.h;
+    pl_shader sh = pl_dispatch_begin(dispatch);
+    sh_describef(sh, "motion hidden fill (%dx%d)", w, h);
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 16, 16, false, 0))
+        goto error;
+
+    ident_t src = bind_tex(sh, "flow_in", flow);
+    ident_t blk = bind_tex(sh, "blocks", blocks);
+    ident_t ref_id = bind_tex(sh, "ref", ref);
+    ident_t dst = bind_img(sh, "flow_out", out);
+    const float fsig = b_envf("LM_B_FSIG", 0.05f);
+    const int rings = dc_env("LM_B_RINGS", 7);
+
+    // clang-format off
+#pragma GLSL /* motion_fill_pass */                                             \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 grid = ivec2(${const int: blocks->params.w},                          \
+                       ${const int: blocks->params.h});                         \
+    ivec2 pos  = ivec2(gl_GlobalInvocationID.xy);                               \
+    if (all(lessThan(pos, size))) {                                             \
+        vec4 f = texelFetch($src, pos, 0);                                      \
+        if (f.z < 0.5) {                                                        \
+            const int ax[7] = int[7](1, 2, 3, 5, 8, 12, 16);                    \
+            const int dg[7] = int[7](1, 1, 2, 4, 6, 8, 11);                     \
+            const ivec2 dirs[8] = ivec2[8](ivec2(1, 0), ivec2(1, 1),            \
+                ivec2(0, 1), ivec2(-1, 1), ivec2(-1, 0), ivec2(-1, -1),         \
+                ivec2(0, -1), ivec2(1, -1));                                    \
+            vec2 cand[9];                                                       \
+            float score[9];                                                     \
+            for (int k = 0; k < 9; k++) {                                       \
+                int i = k == 0 ? 4 : k <= 4 ? k - 1 : k;                        \
+                ivec2 b = clamp(pos / ${const int: bs} + ivec2(i % 3, i / 3) - 1,\
+                                ivec2(0), grid - 1);                            \
+                cand[k] = texelFetch($blk, b, 0).xy;                            \
+                score[k] = 0.0;                                                 \
+            }                                                                   \
+            float centre = texelFetch($ref_id, pos, 0).r;                       \
+            for (int r = 0; r < ${const int: rings}; r++) {                     \
+                for (int a = 0; a < 8; a++) {                                   \
+                    ivec2 o = dirs[a] * ((a & 1) == 1 ? dg[r] : ax[r]);         \
+                    ivec2 s = clamp(pos + o, ivec2(0), size - 1);               \
+                    vec4 n = texelFetch($src, s, 0);                            \
+                    if (n.z < 0.5)                                              \
+                        continue;                                               \
+                    float di = (texelFetch($ref_id, s, 0).r - centre)           \
+                             / ${const float: fsig};                            \
+                    float wgt = exp(-di * di) / (1.0 + length(vec2(o)) / 4.0);  \
+                    for (int k = 0; k < 9; k++) {                               \
+                        vec2 dv = cand[k] - n.xy;                               \
+                        if (dot(dv, dv) <= 1.0)                                 \
+                            score[k] += wgt;                                    \
+                    }                                                           \
+                }                                                               \
+            }                                                                   \
+            int best = 0;                                                       \
+            for (int k = 1; k < 9; k++) {                                       \
+                if (score[k] > score[best])                                     \
+                    best = k;                                                   \
+            }                                                                   \
+            if (score[best] > 0.0)                                              \
+                f.xy = cand[best];                                              \
+        }                                                                       \
+        imageStore($dst, pos, f);                                               \
+    }
+    // clang-format on
+
+    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+        .shader = &sh,
+        .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(h, 16), 1 }));
+
+error:
+    pl_dispatch_abort(dispatch, &sh);
+    return false;
+}
+
 // Two contiguous histograms describing the global motion in the frame.
 // One histogram for each component of the motion vector (x,y).
 static const struct pl_buffer_var global_hist_var = {
@@ -2599,6 +2757,15 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
         changed = "parameters changed";
     }
 
+    // EXPERIMENT: stage B needs both directions
+    const int bmode = input->direction == PL_MOTION_BOTH
+                    ? dc_env("LM_B", motion_b_request) : 0;
+    if (bmode != obj->b_mode) {
+        changed = "parameters changed";
+        obj->b_mode = bmode;
+        obj->sig_a = obj->sig_b = 0;
+    }
+
     if (changed) {
         invalidate_temporal(gpu, obj, changed);
         obj->params = *params;
@@ -2671,6 +2838,12 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
         if (!flow_pyramid_recreate(gpu, obj, &obj->flow.bwd, w, h, levels,
                                    params->block_size, mv_fmt) ||
             !dense_flow_recreate(gpu, &obj->flow.dense_bwd, w, h, mv_fmt))
+            goto error;
+    }
+
+    for (int i = 0; i < 2 && bmode; i++) {
+        if (!dense_flow_recreate(gpu, &obj->b_sel[i], w, h, mv_fmt) ||
+            !dense_flow_recreate(gpu, &obj->b_occ[i], w, h, mv_fmt))
             goto error;
     }
 
@@ -2784,6 +2957,7 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
                                 fwd ? obj->scratch.levels.elem[0]
                                     : obj->pyramid_prev.elem[0],
                                 obj->scratch.filtered.elem[0],
+                                bmode ? obj->b_sel[d] :
                                 fwd ? obj->flow.dense_fwd : obj->flow.dense_bwd);
         if (!ok)
             break;
@@ -2808,6 +2982,24 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
 
     if (!ok)
         goto error;
+
+    if (bmode) {
+        const bool fill = dc_env("LM_B_FILL", 1);
+        pl_tex luma[2] = { obj->pyramid_prev.elem[0], obj->scratch.levels.elem[0] };
+        pl_tex dense[2] = { obj->flow.dense_fwd, obj->flow.dense_bwd };
+        pl_tex blocks[2] = { obj->flow.fwd.elem[0], obj->flow.bwd.elem[0] };
+        for (int d = 0; d < 2; d++) {
+            if (!motion_occlusion_pass(gpu, input->dispatch, luma[d],
+                                       obj->b_sel[d], obj->b_sel[!d],
+                                       fill ? obj->b_occ[d] : dense[d]))
+                goto error;
+        }
+        for (int d = 0; d < 2 && fill; d++) {
+            if (!motion_fill_pass(gpu, input->dispatch, params->block_size,
+                                  luma[d], blocks[d], obj->b_occ[d], dense[d]))
+                goto error;
+        }
+    }
 
     obj->flow.valid = input->direction;
     obj->global.valid = input->estimate_global;
@@ -3073,8 +3265,9 @@ static bool frame_interp_local(pl_shader sh,
             return false;
     }
 
+    const bool splat = params->algo == PL_FRAME_INTERP_SPLAT || getenv("LM_SPLAT");
     ident_t gm = NULL_IDENT;
-    if (lm->global > 0.0f)
+    if (lm->global > 0.0f && params->algo != PL_FRAME_INTERP_SPLAT)
         gm = sh_motion_global(sh, *input->state, PL_MOTION_FORWARD);
 
     // The flow fields need not measure the same as the frames.
@@ -3182,7 +3375,7 @@ static bool frame_interp_local(pl_shader sh,
         // clang-format on
     }
 
-    if (getenv("LM_SPLAT") && sharp && dbg_obj && dbg_obj->flow.dense_bwd) {
+    if (splat && sharp && dbg_obj && dbg_obj->flow.dense_bwd) {
         // EXPERIMENT: stage D (splat) + C reading its key buffer directly
         if (dbg_obj->dc_dirty || !dbg_obj->dc_src) {
             if (!dc_prepare(dbg_obj, input->gpu, input->dispatch, input->a.tex, input->b.tex))
@@ -3199,7 +3392,7 @@ static bool frame_interp_local(pl_shader sh,
         const int hole = dc_env("LM_SPLAT_HOLE", 2); // radius searched for holes
         const bool bilin = dc_env("LM_SPLAT_BILIN", 0);
         const bool dbg = dc_env("LM_SPLAT_DEBUG", 0);
-        const int holechk = dc_env("LM_SPLAT_HOLECHK", 0);
+        const int holechk = dc_env("LM_SPLAT_HOLECHK", 2);
         // clang-format off
 #pragma GLSL /* EXPERIMENT splat C */                                           \
     vec4 color;                                                                 \
@@ -3478,12 +3671,17 @@ bool pl_shader_frame_interp(pl_shader sh,
         me_dir = params->local.bidir ? PL_MOTION_BOTH : PL_MOTION_FORWARD;
         me_global = params->local.global > 0.0f;
         break;
+    case PL_FRAME_INTERP_SPLAT:
+        me_dir = PL_MOTION_BOTH;
+        break;
     case PL_FRAME_INTERP_ALGO_COUNT:
     default:
         PL_ERR(sh, "pl_shader_frame_interp: invalid algorithm %d!",
                (int) params->algo);
         return false;
     }
+
+    motion_b_request = params->algo == PL_FRAME_INTERP_SPLAT;
 
     // A no-op if the motion between this pair of frames is already known.
     bool ok = pl_motion_estimate(pl_motion_estimate_input(
@@ -3509,6 +3707,7 @@ bool pl_shader_frame_interp(pl_shader sh,
     case PL_FRAME_INTERP_VISUALIZE:
         return frame_interp_visualize(sh, input, &out_color);
     case PL_FRAME_INTERP_LOCAL_MOTION:
+    case PL_FRAME_INTERP_SPLAT:
         return frame_interp_local(sh, input, params, &out_color);
     case PL_FRAME_INTERP_ALGO_COUNT:
         break;

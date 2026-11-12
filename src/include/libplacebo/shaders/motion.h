@@ -248,6 +248,9 @@ enum pl_frame_interp_algo {
     // weighing the vectors by how well the two frames then agree, and falling
     // back to plain frame mixing where no motion is known.
     PL_FRAME_INTERP_LOCAL_MOTION,
+    // EXPERIMENTAL: per pixel vectors with occlusion, splatted to the
+    // intermediate frame's time, then one sample of each frame per pixel.
+    PL_FRAME_INTERP_SPLAT,
 
     PL_FRAME_INTERP_ALGO_COUNT,
 };
