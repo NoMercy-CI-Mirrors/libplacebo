@@ -460,6 +460,7 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
 
             if (ipar->algo == PL_FRAME_INTERP_LOCAL_MOTION) {
                 struct pl_frame_interp_local_params *lm = &ipar->local;
+                nk_layout_row_dynamic(nk, 24, 2);
                 nk_checkbox_label(nk, "Bidirectional", &lm->bidir);
                 nk_property_float(nk, "Lattice pitch (flow px)", 1.0f, &lm->pitch,
                                   32.0f, 0.5f, 0.05f);
@@ -499,6 +500,7 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 static const char *cleans[] = {
                     "Off", "Median", "Median + minimum",
                 };
+                nk_layout_row_dynamic(nk, 24, 2);
                 nk_label(nk, "Show:", NK_TEXT_LEFT);
                 mx->show = nk_combo(nk, shows, 6, mx->show, 16,
                                     nk_vec2(nk_widget_width(nk), 300));
