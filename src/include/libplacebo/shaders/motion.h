@@ -176,12 +176,12 @@ PL_API bool pl_motion_debug_gather_set(pl_shader_obj state, int dir,
 
 // EXPERIMENT: replace what `PL_FRAME_INTERP_MIX` reads for `dir` (0 fwd,
 // 1 bwd) after an estimation: the vectors (rg16f, one per pixel) and the
-// quality (two u8 per pixel: quality, static flag).
+// quality (two u8 per pixel: quality, unused).
 PL_API bool pl_motion_debug_mix_set(pl_shader_obj state, int dir,
                                     const void *flow, const uint8_t *quality);
 
 // EXPERIMENT: the quality field of `dir` as `PL_FRAME_INTERP_MIX` reads it
-// (rg8: quality, static flag), or with `raw`, before it was cleaned.
+// (rg8: quality, unused), or with `raw`, before it was cleaned.
 PL_API pl_tex pl_motion_debug_mix_get(pl_shader_obj state, int dir, bool raw);
 
 // Returns the buffer holding the global motion vector in the direction `dir`
@@ -357,14 +357,10 @@ struct pl_frame_interp_mix_params {
     // Give hidden pixels the vector of the nearest visible pixels.
     bool fill;
 
-    // Mean absolute difference between both frames around a pixel, in 8 bit
-    // code values, below which it counts as static for `static_test` = 2.
-    float static_thresh;
-
     // --- Synthesis, per output frame
 
     // What to output: 0 = the result, 1 = Q, 2 = the compensated sample, 3 =
-    // the fallback blend, 4 = the static veto (red) and V (green/blue), 5 =
+    // the fallback blend, 4 = V (red/green), 5 =
     // the field the vector was taken from (red forward, blue backward), 6 =
     // the share of the vector `stat_cand` in the output through the fallback
     // (red), through the compensated sample (green), and in the fallback
@@ -374,8 +370,7 @@ struct pl_frame_interp_mix_params {
     int show;
 
     // For `show` = 6, with `neigh`: 0/1 = forward/backward field at the
-    // pixel, 2-9 = those to the right, left, below and above, 10 = none, 11 =
-    // block motion, 12 = affine, as far as `fallback` has them, anything
+    // pixel, 2-9 = those to the right, left, below and above, anything
     // higher = plain frame mixing. For `show` = 7 and 8 also -1 = the
     // fallback, -2 = the compensated sample.
     int stat_cand;
@@ -396,28 +391,17 @@ struct pl_frame_interp_mix_params {
     // 1 = the pixel's own vector, 2 = the smooth block motion around it, 3 =
     // per pixel none or 2, by how well the frames then agree, 4 = instead of
     // one V, the vectors `neigh` adds, weighed by how well the frames agree
-    // along each, 5 = like 4, with none and 2 among them, 6 = an affine model
-    // of the motion of the whole frame, 7 = like 5, with 6 among them.
+    // along each.
     int fallback;
-
-    // A moving V yields to plain frame mixing where it samples a static
-    // pixel: 0 = never, 1 = a pixel whose vector is zero, 2 = a pixel that
-    // is the same in both frames and not flat, 3 = a pixel that moves
-    // differently from V (by 2 px for 1/e), static or not, 4 = both 1 and 2.
-    int static_test;
 
     // Tolerated mismatch between the two samples of the fallback candidates,
     // for `fallback` = 3, as a difference in the square root of their luma.
     float sigma;
 
-    // For `fallback` >= 4: weight of plain frame mixing next to the vectors,
+    // For `fallback` = 4: weight of plain frame mixing next to the vectors,
     // each of which weighs up to 1. Where the frames agree along none of
-    // them, or `static_test` rejects them, this is what remains.
+    // them, this is what remains.
     float giveup;
-
-    // For `fallback` = 7: weight of the affine model next to the other
-    // vectors, each of which weighs up to 1.
-    float affine;
 
     // Difference, in the square root of the luma, between the two
     // compensated samples at which Q falls to 1/e, beyond the difference
@@ -437,9 +421,8 @@ struct pl_frame_interp_mix_params {
 #define PL_FRAME_INTERP_MIX_DEFAULTS                                           \
     .q_vis = 1.0f, .q_cost_lo = 0.35f, .q_cost_hi = 0.8f, .q_outlier = 2.0f,   \
     .q_cost_flat = 6.0f, .q_border = 1.0f, .fill = true,                       \
-    .clean = 1, .soften = 1.5f, .static_thresh = 1.0f, .pick = 2,              \
-    .consist = 2.0f, .fallback = 5, .static_test = 4, .sigma = 0.2f,           \
-    .giveup = 2.0f, .affine = 1.0f, .neigh = 4.0f, .sharp = true,
+    .clean = 1, .soften = 1.5f, .pick = 2, .consist = 2.0f, .fallback = 4,     \
+    .sigma = 0.2f, .giveup = 2.0f, .neigh = 4.0f, .sharp = true,
 
 // Tunable parameters. Kept separate from the per-call inputs so that callers
 // can reuse unchanging configurations.

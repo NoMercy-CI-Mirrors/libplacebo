@@ -93,16 +93,6 @@ struct sh_motion_obj {
         struct pl_frame_interp_mix_params params;
     } mix;
 
-    // Affine model of the forward motion of the whole frame, as an SSBO
-    // described by `model_var`, fitted on demand by `motion_model_fit`.
-    // `valid` is whether it describes the current frame pair. `acc` is
-    // scratch for fitting it.
-    struct {
-        pl_buf buf;
-        pl_buf acc;
-        bool valid;
-    } model;
-
     // Dimensions of `flow.fwd.elem[0]` (number of blocks to cover the full
     // resolution).
     int grid_w, grid_h;
@@ -697,8 +687,6 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
         pl_tex_destroy(gpu, &obj->mix.tmp[i][1]);
         pl_tex_destroy(gpu, &obj->mix.vec[i]);
     }
-    pl_buf_destroy(gpu, &obj->model.buf);
-    pl_buf_destroy(gpu, &obj->model.acc);
     pl_buf_destroy(gpu, &obj->global.fwd);
     pl_buf_destroy(gpu, &obj->global.bwd);
     pl_buf_destroy(gpu, &obj->global.hist);
@@ -717,7 +705,6 @@ static void invalidate_temporal(pl_gpu gpu, struct sh_motion_obj *obj,
     obj->sig_a = obj->sig_b = 0;
     obj->flow.valid = 0;
     obj->global.valid = false;
-    obj->model.valid = false;
     obj->pyramid_valid = false;
 
     pl_buf_destroy(gpu, &obj->global.fwd);
@@ -2156,7 +2143,7 @@ static bool mix_b_params_eq(const struct pl_frame_interp_mix_params *a,
            a->q_border == b->q_border &&
            a->clean == b->clean &&
            a->soften == b->soften && a->vec_median == b->vec_median &&
-           a->fill == b->fill && a->static_thresh == b->static_thresh;
+           a->fill == b->fill;
 }
 
 // Two component format of the quality fields of `frame_interp_mix`.
@@ -2197,8 +2184,7 @@ static void sh_median9(pl_shader sh)
 // leads, relative to its own texture, the vector differs from the median of
 // those around it, or leaves the frame. See `pl_frame_interp_mix_params`.
 //
-// `qual` (y) is whether the pixel is static: its surroundings are the same in
-// both frames, and not flat. The vectors are copied to `out`, or replaced by their median.
+// The vectors are copied to `out`, or replaced by their median.
 static bool motion_quality_pass(pl_dispatch dp, pl_tex ref, pl_tex tgt,
                                 pl_tex flow, pl_tex vis, pl_tex out, pl_tex qual,
                                 const struct pl_frame_interp_mix_params *mp)
@@ -2222,7 +2208,6 @@ static bool motion_quality_pass(pl_dispatch dp, pl_tex ref, pl_tex tgt,
     const bool median = mp->vec_median, outlier = mp->q_outlier > 0.0f;
     const bool cost = mp->q_cost_hi > 0.0f;
     const float inv_outlier = outlier ? 1.0f / PL_SQUARE(mp->q_outlier) : 0.0f;
-    const float thresh = PL_MAX(mp->static_thresh, 1e-3f) / 255.0f;
     // clang-format off
 #pragma GLSL /* motion_quality_pass */ \
     ivec2 size = ivec2(${const int: w}, ${const int: h}); \
@@ -2254,14 +2239,13 @@ static bool motion_quality_pass(pl_dispatch dp, pl_tex ref, pl_tex tgt,
         if (texelFetch($vis_id, pos, 0).x < 0.5) \
             q *= ${float: 1.0f - PL_CLAMP(mp->q_vis, 0.0f, 1.0f)}; \
         float centre = texelFetch($ref_id, pos, 0).r; \
-        float ssd = 0.0, energy = 0.0, sad = 0.0; \
+        float ssd = 0.0, energy = 0.0; \
         for (int j = 0; j < 9; j++) { \
             ivec2 p = clamp(pos + ivec2(j % 3, j / 3) - 1, ivec2(0), size - 1); \
             float r = texelFetch($ref_id, p, 0).r; \
             float d = r - textureLod($tgt_id, (vec2(p) + vec2(0.5) + f) / vec2(size), 0.0).r; \
             ssd += d * d; \
             energy += (r - centre) * (r - centre); \
-            sad += abs(r - texelFetch($tgt_id, p, 0).r); \
         } \
         @if (cost) { \
         float c = sqrt(ssd / (energy + ${float: 9.0f * PL_SQUARE(PL_MAX(mp->q_cost_flat, 0.1f) / 255.0f)})); \
@@ -2269,18 +2253,8 @@ static bool motion_quality_pass(pl_dispatch dp, pl_tex ref, pl_tex tgt,
         @} \
         if (leaves) \
             q = qleave; \
-        float still = 1.0 - smoothstep(${float: 0.5f * thresh}, ${float: thresh}, sad / 9.0); \
-        /* a flat area is the same in both frames whether it moves or not */ \
-        for (int j = 0; j < 4; j++) { \
-            ivec2 o = (j & 2) == 0 ? ivec2(3, 0) : ivec2(0, 3); \
-            ivec2 p = clamp(pos + ((j & 1) == 0 ? o : -o), ivec2(0), size - 1); \
-            float d = texelFetch($ref_id, p, 0).r - centre; \
-            energy += d * d; \
-        } \
-        float flat2 = ${float: 13.0f * PL_SQUARE(PL_MAX(mp->q_cost_flat, 0.1f) / 255.0f)}; \
-        still *= energy / (energy + flat2); \
         imageStore($dst, pos, vec4(f, 0.0, 0.0)); \
-        imageStore($qdst, pos, vec4(q, still, 0.0, 0.0)); \
+        imageStore($qdst, pos, vec4(q, 0.0, 0.0, 0.0)); \
     }
     // clang-format on
     return pl_dispatch_compute(dp, pl_dispatch_compute_params(
@@ -2962,7 +2936,6 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
 
     obj->flow.valid = input->direction;
     obj->global.valid = input->estimate_global;
-    obj->model.valid = false;
 
     // Cache frame `b`'s luma pyramid, use reuse `a` buffers as scratch.
     PL_SWAP(obj->pyramid_prev, obj->scratch.levels);
@@ -2973,279 +2946,6 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
 error:
     invalidate_temporal(gpu, obj, "estimation failed");
     return false;
-}
-
-// The affine model `mv = mat2x3(model) * vec3(pos, 1)` of the global motion,
-// with `pos` and `mv` in pixels. `model[0..2]` yields `mv.x` and `model[3..5]`
-// yields `mv.y`.
-static const struct pl_buffer_var model_var = {
-    .var = {
-        .name  = "motion_model",
-        .type  = PL_VAR_FLOAT,
-        .dim_v = 1,
-        .dim_m = 1,
-        .dim_a = 6,
-    },
-    .layout = {
-        .size   = 6 * sizeof(float),
-        .stride = sizeof(float),
-    },
-};
-
-// Blocks are summed in tiles of `MOTION_MODEL_TILE_DIM` squared, each into
-// `MOTION_MODEL_SUMS` floats of `sh_motion_obj.model.acc`.
-#define MOTION_MODEL_TILE_DIM 8
-#define MOTION_MODEL_SUMS 12
-
-static struct pl_buffer_var model_acc_var(int num_tiles)
-{
-    return (struct pl_buffer_var) {
-        .var = {
-            .name  = "model_acc",
-            .type  = PL_VAR_FLOAT,
-            .dim_v = 1,
-            .dim_m = 1,
-            .dim_a = num_tiles * MOTION_MODEL_SUMS,
-        },
-        .layout = {
-            .size   = num_tiles * MOTION_MODEL_SUMS * sizeof(float),
-            .stride = sizeof(float),
-        },
-    };
-}
-
-// Accumulates the normal equations of a least squares fit of the affine model
-// to the blocks of `flow` into `acc`. Unless this is
-// the `first` iteration, leaves out the blocks further than `inlier_dist` from
-// the model currently in `model`. Positions are scaled to [-1, 1] for the fit,
-// to keep the sums well conditioned.
-static bool motion_model_acc_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex flow,
-                                  int bs, int w, int h, pl_buf acc,
-                                  pl_buf model, bool first, float inlier_dist)
-{
-    const int grid_w = flow->params.w, grid_h = flow->params.h;
-    const int dim = MOTION_MODEL_TILE_DIM;
-    const int tiles_w = PL_DIV_UP(grid_w, dim), tiles_h = PL_DIV_UP(grid_h, dim);
-    const struct pl_buffer_var acc_var = model_acc_var(tiles_w * tiles_h);
-
-    pl_shader sh = pl_dispatch_begin(dispatch);
-    sh_describef(sh, "motion model accumulation (%dx%d blocks)", grid_w, grid_h);
-    sh->output = PL_SHADER_SIG_NONE;
-
-    // One thread per tile: the sums are too few to be worth reducing over
-    // shared memory.
-    if (!sh_try_compute(sh, 1, 1, false, 0)) {
-        PL_ERR(gpu, "pl_shader_frame_interp: cannot create motion model "
-               "accumulation shader!");
-        goto error;
-    }
-
-    ident_t src = bind_tex(sh, "flow_in", flow);
-    bind_buf(sh, "model_acc_buf", acc, PL_DESC_ACCESS_WRITEONLY, &acc_var, 1);
-    if (!first) {
-        bind_buf(sh, "motion_model_buf", model, PL_DESC_ACCESS_READONLY,
-                 &model_var, 1);
-    }
-
-    // clang-format off
-#pragma GLSL /* motion_model_acc_pass */                                        \
-    ivec2 grid = ivec2(${const int: grid_w}, ${const int: grid_h});             \
-    vec2 size = vec2(${const float: w}, ${const float: h});                     \
-    ivec2 tile = ivec2(gl_WorkGroupID.xy);                                      \
-    /* Upper triangle of sum(w * p * p^T), then sum(w * p * mv.x) and           \
-     * sum(w * p * mv.y), for p = vec3(pos, 1). */                               \
-    float s[${const int: MOTION_MODEL_SUMS}];                                   \
-    for (int i = 0; i < ${const int: MOTION_MODEL_SUMS}; i++)                   \
-        s[i] = 0.0;                                                             \
-    for (int y = 0; y < ${const int: dim}; y++) {                               \
-        for (int x = 0; x < ${const int: dim}; x++) {                           \
-            ivec2 blk = tile * ${const int: dim} + ivec2(x, y);                 \
-            if (any(greaterThanEqual(blk, grid)))                               \
-                continue;                                                       \
-            vec2 flow = texelFetch($src, blk, 0).xy;                            \
-            vec2 px = min((vec2(blk) + vec2(0.5)) * ${const float: bs}, size);  \
-            vec3 p = vec3(px / size * 2.0 - vec2(1.0), 1.0);                    \
-            float w = 1.0;                                                      \
-            @if (!first) {                                                      \
-                vec3 q = vec3(px, 1.0);                                         \
-                vec2 mv = vec2(dot(vec3(motion_model[0], motion_model[1],       \
-                                        motion_model[2]), q),                   \
-                               dot(vec3(motion_model[3], motion_model[4],       \
-                                        motion_model[5]), q));                  \
-                if (distance(flow, mv) >= ${float: inlier_dist})                \
-                    w = 0.0;                                                    \
-            @}                                                                  \
-            s[0]  += w * p.x * p.x;                                             \
-            s[1]  += w * p.x * p.y;                                             \
-            s[2]  += w * p.x;                                                   \
-            s[3]  += w * p.y * p.y;                                             \
-            s[4]  += w * p.y;                                                   \
-            s[5]  += w;                                                         \
-            s[6]  += w * p.x * flow.x;                                          \
-            s[7]  += w * p.y * flow.x;                                          \
-            s[8]  += w * flow.x;                                                \
-            s[9]  += w * p.x * flow.y;                                          \
-            s[10] += w * p.y * flow.y;                                          \
-            s[11] += w * flow.y;                                                \
-        }                                                                       \
-    }                                                                           \
-    int base = (tile.y * ${const int: tiles_w} + tile.x) *                      \
-               ${const int: MOTION_MODEL_SUMS};                                 \
-    for (int i = 0; i < ${const int: MOTION_MODEL_SUMS}; i++)                   \
-        model_acc[base + i] = s[i];
-    // clang-format on
-
-    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
-        .shader        = &sh,
-        .dispatch_size = { tiles_w, tiles_h, 1 },
-    ));
-
-error:
-    pl_dispatch_abort(dispatch, &sh);
-    return false;
-}
-
-// Solves the normal equations that `motion_model_acc_pass` left in `acc`, and
-// writes the result to `model`, converted to pixel positions.
-static bool motion_model_solve_pass(pl_gpu gpu, pl_dispatch dispatch,
-                                    pl_buf acc, int num_tiles, int w, int h,
-                                    pl_buf model)
-{
-    const struct pl_buffer_var acc_var = model_acc_var(num_tiles);
-
-    pl_shader sh = pl_dispatch_begin(dispatch);
-    sh_describef(sh, "motion model solve (%d tiles)", num_tiles);
-    sh->output = PL_SHADER_SIG_NONE;
-
-    // `lanes` threads per sum, each over every `lanes`-th tile
-    const int sums = MOTION_MODEL_SUMS, lanes = 16;
-    if (!sh_try_compute(sh, lanes, sums, false,
-                        sums * lanes * sizeof(float))) {
-        PL_ERR(gpu, "pl_shader_frame_interp: cannot create motion model solve "
-               "shader!");
-        goto error;
-    }
-
-    bind_buf(sh, "model_acc_buf", acc, PL_DESC_ACCESS_READONLY, &acc_var, 1);
-    bind_buf(sh, "motion_model_buf", model, PL_DESC_ACCESS_WRITEONLY,
-             &model_var, 1);
-
-    // clang-format off
-#pragma GLSLH /* motion_model_solve_pass */                                     \
-    shared float s_sums[${const int: sums}][${const int: lanes}];
-
-#pragma GLSL /* motion_model_solve_pass */                                      \
-    int lane = int(gl_LocalInvocationID.x), idx = int(gl_LocalInvocationID.y);  \
-    float sum = 0.0;                                                            \
-    for (int t = lane; t < ${const int: num_tiles}; t += ${const int: lanes})   \
-        sum += model_acc[t * ${const int: sums} + idx];                         \
-    s_sums[idx][lane] = sum;                                                    \
-    barrier();                                                                  \
-                                                                                \
-    if (lane == 0 && idx == 0) {                                                \
-    float s[${const int: sums}];                                                \
-    for (int i = 0; i < ${const int: sums}; i++) {                              \
-        s[i] = 0.0;                                                             \
-        for (int l = 0; l < ${const int: lanes}; l++)                           \
-            s[i] += s_sums[i][l];                                               \
-    }                                                                           \
-    /* Bias a badly conditioned fit, e.g. to blocks along a single line,        \
-     * towards a pure translation. */                                           \
-    float reg = 1e-4 * s[5];                                                    \
-    mat3 A = mat3(s[0] + reg, s[1],       s[2],                                 \
-                  s[1],       s[3] + reg, s[4],                                 \
-                  s[2],       s[4],       s[5]);                                \
-    /* Without any confident block, there is no motion. */                      \
-    vec3 mx = vec3(0.0), my = vec3(0.0);                                        \
-    float det = determinant(A);                                                 \
-    if (s[5] > 1e-3 && abs(det) > 1e-20) {                                      \
-        /* inverse() needs GLSL 140; A is symmetric. */                         \
-        mat3 Ai = mat3(A[1][1] * A[2][2] - A[2][1] * A[1][2],                   \
-                       A[2][1] * A[0][2] - A[0][1] * A[2][2],                   \
-                       A[0][1] * A[1][2] - A[1][1] * A[0][2],                   \
-                       A[2][0] * A[1][2] - A[1][0] * A[2][2],                   \
-                       A[0][0] * A[2][2] - A[2][0] * A[0][2],                   \
-                       A[1][0] * A[0][2] - A[0][0] * A[1][2],                   \
-                       A[1][0] * A[2][1] - A[2][0] * A[1][1],                   \
-                       A[2][0] * A[0][1] - A[0][0] * A[2][1],                   \
-                       A[0][0] * A[1][1] - A[1][0] * A[0][1]) / det;            \
-        mx = Ai * vec3(s[6], s[7], s[8]);                                       \
-        my = Ai * vec3(s[9], s[10], s[11]);                                     \
-    }                                                                           \
-    /* From pos * 2 / size - 1 to pixel positions. */                           \
-    vec2 scale = vec2(2.0) / vec2(${const float: w}, ${const float: h});        \
-    motion_model[0] = mx.x * scale.x;                                           \
-    motion_model[1] = mx.y * scale.y;                                           \
-    motion_model[2] = mx.z - mx.x - mx.y;                                       \
-    motion_model[3] = my.x * scale.x;                                           \
-    motion_model[4] = my.y * scale.y;                                           \
-    motion_model[5] = my.z - my.x - my.y;                                       \
-    }
-    // clang-format on
-
-    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
-        .shader        = &sh,
-        .dispatch_size = { 1, 1, 1 },
-    ));
-
-error:
-    pl_dispatch_abort(dispatch, &sh);
-    return false;
-}
-
-// Refits of the affine model to the blocks within MOTION_MODEL_INLIER pixels
-// of the previous fit.
-#define MOTION_MODEL_REFITS 2
-#define MOTION_MODEL_INLIER 4.0f
-
-// Fits the affine model of the global motion to the forward block field of
-// the current frame pair, into `obj->model.buf`, unless it is already there.
-static bool motion_model_fit(pl_gpu gpu, pl_dispatch dispatch,
-                             struct sh_motion_obj *obj)
-{
-    if (obj->model.valid)
-        return true;
-
-    pl_tex flow = obj->flow.fwd.elem[0];
-    const int num_tiles = PL_DIV_UP(flow->params.w, MOTION_MODEL_TILE_DIM) *
-                          PL_DIV_UP(flow->params.h, MOTION_MODEL_TILE_DIM);
-
-    const size_t acc_size = model_acc_var(num_tiles).layout.size;
-    if (obj->model.acc && obj->model.acc->params.size != acc_size)
-        pl_buf_destroy(gpu, &obj->model.acc);
-    if (!obj->model.acc) {
-        obj->model.acc = pl_buf_create(gpu, pl_buf_params(
-            .size      = acc_size,
-            .storable  = true,
-            .debug_tag = PL_DEBUG_TAG,
-        ));
-    }
-    if (!obj->model.buf) {
-        obj->model.buf = pl_buf_create(gpu, pl_buf_params(
-            .size      = model_var.layout.size,
-            .storable  = true,
-            .debug_tag = PL_DEBUG_TAG,
-        ));
-    }
-    if (!obj->model.acc || !obj->model.buf) {
-        PL_ERR(gpu, "pl_shader_frame_interp: failed creating motion model "
-               "buffers!");
-        return false;
-    }
-
-    obj->model.valid = false;
-    for (int i = 0; i <= MOTION_MODEL_REFITS; i++) {
-        if (!motion_model_acc_pass(gpu, dispatch, flow, obj->params.block_size,
-                                   obj->w, obj->h, obj->model.acc,
-                                   obj->model.buf, i == 0, MOTION_MODEL_INLIER))
-            return false;
-        if (!motion_model_solve_pass(gpu, dispatch, obj->model.acc, num_tiles,
-                                     obj->w, obj->h, obj->model.buf))
-            return false;
-    }
-
-    obj->model.valid = true;
-    return true;
 }
 
 // Mixes the two frames, each sampled at the position offset by the global
@@ -3981,15 +3681,10 @@ static bool frame_interp_mix(pl_shader sh,
     const float inv_veto = veto ? 1.0f / PL_SQUARE(mp->veto) : 0.0f;
     const float inv_sigma = 1.0f / PL_SQUARE(PL_MAX(mp->sigma, 1e-3f));
     const int pick = mp->pick, fallback = mp->fallback, show = mp->show;
-    const int stest = mp->static_test;
-    const bool local = fallback == 2 || fallback == 3 || fallback == 5 || fallback == 7;
-    const bool sharp = mp->sharp, affine = fallback >= 6;
-    const int ncand = fallback == 7 ? 13 : fallback == 5 ? 12 : 10;
+    const bool local = fallback == 2 || fallback == 3, sharp = mp->sharp;
+    // The vectors of both fields at the pixel and at 4 pixels around it
+    const int ncand = 10;
     const int mask = mp->cand_mask & ((1 << ncand) - 1);
-    if (affine) {
-        bind_buf(sh, "motion_model_buf", obj->model.buf, PL_DESC_ACCESS_READONLY,
-                 &model_var, 1);
-    }
     const int neigh = PL_CLAMP((int) roundf(mp->neigh), 0, 64);
     ident_t blkf = NULL_IDENT, blkb = NULL_IDENT;
     if (local) {
@@ -4011,36 +3706,24 @@ static bool frame_interp_mix(pl_shader sh,
     float m_luma(vec4 c) { \
         return sqrt(max(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0)); \
     } \
-    /* Quality of the vector `v` at the pixel centred on `c`, and whether */ \
-    /* it samples a static pixel in either frame */ \
-    vec2 m_eval(vec2 c, vec2 v, float t) { \
+    /* Quality of the vector `v` at the pixel centred on `c` */ \
+    float m_eval(vec2 c, vec2 v, float t) { \
         ivec2 size = ivec2(${const int: w}, ${const int: h}); \
         vec2 fsz = vec2(size); \
         vec2 qa = c - t * v, qb = c + (1.0 - t) * v; \
-        vec2 sa = textureLod($qfwd, (qa + 0.5) / fsz, 0.0).xy; \
-        vec2 sb = textureLod($qbwd, (qb + 0.5) / fsz, 0.0).xy; \
+        float sa = textureLod($qfwd, (qa + 0.5) / fsz, 0.0).x; \
+        float sb = textureLod($qbwd, (qb + 0.5) / fsz, 0.0).x; \
         /* a side that is out of the frame does not count */ \
         float ina = m_in(qa, fsz), inb = m_in(qb, fsz); \
-        float q = min(mix(1.0, sa.x, ina), mix(1.0, sb.x, inb)) * max(ina, inb); \
-        float still = 0.0; \
-        @if (consist || stest == 1 || stest >= 3) { \
+        float q = min(mix(1.0, sa, ina), mix(1.0, sb, inb)) * max(ina, inb); \
+        @if (consist) { \
         ivec2 ia = clamp(ivec2(floor(qa + 0.5)), ivec2(0), size - 1); \
         ivec2 ib = clamp(ivec2(floor(qb + 0.5)), ivec2(0), size - 1); \
         vec2 fa = texelFetch($fwd, ia, 0).xy, fb = texelFetch($bwd, ib, 0).xy; \
         vec2 da = fa - v, db = fb + v; \
-        float differ = max(ina * dot(da, da), inb * dot(db, db)); \
-        @if (consist) \
-            q *= exp(-differ * ${float: inv_consist}); \
-        @if (stest == 3) \
-            still = 1.0 - exp(-0.25 * differ); \
-        @if (stest == 4) \
-            still = max(exp(-4.0 * dot(fa, fa)) * sa.y, exp(-4.0 * dot(fb, fb)) * sb.y); \
-        @if (stest == 1) \
-            still = max(exp(-4.0 * dot(fa, fa)), exp(-4.0 * dot(fb, fb))); \
+        q *= exp(-max(ina * dot(da, da), inb * dot(db, db)) * ${float: inv_consist}); \
         @} \
-        @if (stest == 2) \
-            still = max(sa.y, sb.y); \
-        return vec2(q, still); \
+        return q; \
     }
 
 #pragma GLSL /* frame_interp_mix */ \
@@ -4057,33 +3740,23 @@ static bool frame_interp_mix(pl_shader sh,
     vec2 vf = texelFetch($fwd, ip, 0).xy, vb = -texelFetch($bwd, ip, 0).xy; \
     vec2 v = vf; \
     float side = 0.0; \
-    @if (affine) { \
-    /* the model's motion of what is at this pixel at t: x = p + t (M p + c) */ \
-    mat2 am = mat2(motion_model[0], motion_model[3], motion_model[1], motion_model[4]); \
-    vec2 ao = vec2(motion_model[2], motion_model[5]); \
-    mat2 ab = mat2(1.0) + t * am; \
-    float adet = ab[0][0] * ab[1][1] - ab[1][0] * ab[0][1]; \
-    vec2 ax = P - t * ao; \
-    vec2 ap = abs(adet) > 1e-3 ? mat2(ab[1][1], -ab[0][1], -ab[1][0], ab[0][0]) * ax / adet : ax; \
-    vec2 va = am * ap + ao; \
-    @} \
     @if (pick == 1) { \
     if (t > 0.5) { \
         v = vb; \
         side = 1.0; \
     } \
     @} \
-    vec2 ev = m_eval(c0, v, t); \
+    float ev = m_eval(c0, v, t); \
     @if (pick >= 2) { \
-    vec2 eb = m_eval(c0, vb, t); \
+    float eb = m_eval(c0, vb, t); \
     /* equally good: the nearer frame's */ \
-    if (eb.x > ev.x + (t > 0.5 ? -0.02 : 0.02)) { \
+    if (eb > ev + (t > 0.5 ? -0.02 : 0.02)) { \
         v = vb; \
         ev = eb; \
         side = 1.0; \
     } \
     @} \
-    float Q = ev.x; \
+    float Q = ev; \
     @if (neigh > 0) { \
     /* the vectors of both fields at the pixel and around it, each weighed */ \
     /* by its quality and by how well the two frames agree along it */ \
@@ -4106,35 +3779,16 @@ static bool frame_interp_mix(pl_shader sh,
         } \
         ivec2 pk = clamp(ip + o, ivec2(0), size - 1); \
         vec2 vk = (k & 1) == 0 ? texelFetch($fwd, pk, 0).xy : -texelFetch($bwd, pk, 0).xy; \
-        @if (ncand > 10) { \
-        /* no motion, and the smooth block motion */ \
-        if (k == 10) \
-            vk = vec2(0.0); \
-        if (k == 11) { \
-            vec2 bp = P / vec2(${const float: bgw}, ${const float: bgh}); \
-            vk = 0.5 * (textureLod($blkf, bp, 0.0).xy - textureLod($blkb, bp, 0.0).xy); \
-        } \
-        @} \
-        @if (ncand > 12) { \
-        if (k == 12) \
-            vk = va; \
-        @} \
-        vec2 ek = m_eval(c0, vk, t); \
+        float ek = m_eval(c0, vk, t); \
         vec2 ka = c0 - t * vk, kb = c0 + (1.0 - t) * vk; \
         vec4 ca = m_sa((ka + 0.5) * isz), cb = m_sb((kb + 0.5) * isz); \
         float ia = m_in(ka, fsz), ib = m_in(kb, fsz); \
         float ph = ia * ib * abs(m_luma(ca) - m_luma(cb)); \
-        float wk = (ek.x + 0.02) * exp(-ph * ph * ${float: inv_sigma}) + 1e-9; \
+        float wk = (ek + 0.02) * exp(-ph * ph * ${float: inv_sigma}) + 1e-9; \
         float ua = (1.0 - t) * ia, ub = t * ib; \
         vec4 ck = ua + ub > 0.0 ? (ua * ca + ub * cb) / (ua + ub) : mix(ca, cb, t); \
-        /* for the fallback, by the agreement alone, less what the static */ \
-        /* test rejects */ \
-        float wf = exp(-ph * ph * ${float: inv_sigma}) \
-                 * (1.0 - ek.y * (1.0 - exp(-4.0 * dot(vk, vk)))) + 1e-9; \
-        @if (ncand > 12) { \
-        if (k == 12) \
-            wf *= ${float: mp->affine}; \
-        @} \
+        /* for the fallback, by the agreement alone */ \
+        float wf = exp(-ph * ph * ${float: inv_sigma}) + 1e-9; \
         if (k == ${int: mp->stat_cand}) { \
             sf = wf; \
             sg = wk; \
@@ -4145,15 +3799,13 @@ static bool frame_interp_mix(pl_shader sh,
         gs += wk * ck; \
         vs += wk * vk; \
         ws += wk; \
-        qs += wk * ek.x; \
+        qs += wk * ek; \
         v2 += wk * dot(vk, vk); \
     } \
     v = vs / ws; \
     Q = qs / ws; \
     /* where they agree, one sample along their mean instead */ \
     float agree = exp(-max(v2 / ws - dot(v, v), 0.0)); \
-    @if (fallback == 1) \
-        ev.y = m_eval(c0, v, t).y; \
     @} \
     vec2 qa = c0 - t * v, qb = c0 + (1.0 - t) * v; \
     vec4 za = m_sa(pa), zb = m_sb(pb); \
@@ -4173,37 +3825,28 @@ static bool frame_interp_mix(pl_shader sh,
     vec4 F = mix(za, zb, t); \
     vec4 plain = F; \
     vec2 V = vec2(0.0); \
-    float still = 0.0, wv = 0.0; \
+    float wv = 0.0; \
     float ef = abs(m_luma(za) - m_luma(zb)); \
     @if (fallback == 1) { \
     V = v; \
-    still = ev.y; \
     wv = 1.0; \
     @} \
     @if (fallback == 2 || fallback == 3) { \
     vec2 bp = P / vec2(${const float: bgw}, ${const float: bgh}); \
     V = 0.5 * (textureLod($blkf, bp, 0.0).xy - textureLod($blkb, bp, 0.0).xy); \
-    still = m_eval(c0, V, t).y; \
     wv = 1.0; \
     @} \
-    @if (fallback == 6) { \
-    V = va; \
-    still = m_eval(c0, V, t).y; \
-    wv = 1.0; \
-    @} \
-    @if ((fallback >= 1 && fallback <= 3) || fallback == 6) { \
+    @if (fallback >= 1 && fallback <= 3) { \
     vec4 fa = m_sa((c0 - t * V + 0.5) * isz), fb = m_sb((c0 + (1.0 - t) * V + 0.5) * isz); \
     float ev1 = abs(m_luma(fa) - m_luma(fb)); \
     @if (fallback == 3) \
         wv = exp(-max(ev1 * ev1 - ef * ef, 0.0) * ${float: inv_sigma}); \
-    still *= 1.0 - exp(-4.0 * dot(V, V)); \
-    wv *= 1.0 - still; \
     /* a sample out of the frame does not count */ \
     float ua = (1.0 - t) * m_in(c0 - t * V, fsz), ub = t * m_in(c0 + (1.0 - t) * V, fsz); \
     F = mix(F, ua + ub > 0.0 ? (ua * fa + ub * fb) / (ua + ub) : mix(fa, fb, t), wv); \
     ef = mix(ef, ev1, wv); \
     @} \
-    @if ((fallback == 4 || fallback == 5 || fallback == 7) && neigh > 0) \
+    @if (fallback == 4 && neigh > 0) \
         F = (fs + ${float: mp->giveup} * F) / (fw + ${float: mp->giveup}); \
     @if (veto) { \
     float eg = max(abs(m_luma(ga) - m_luma(gb)) - ef, 0.0); \
@@ -4217,7 +3860,7 @@ static bool frame_interp_mix(pl_shader sh,
     @if (show == 3) \
         color = F; \
     @if (show == 4) \
-        color = vec4(still, 0.5 + V / 64.0, 1.0); \
+        color = vec4(0.5 + V / 64.0, 0.5, 1.0); \
     @if (show == 6 && neigh > 0) { \
     /* share of one vector (or, past the last, of plain mixing) in the */ \
     /* output through F, through G, and in F */ \
@@ -4292,8 +3935,6 @@ bool pl_shader_frame_interp(pl_shader sh,
         return false;
     }
 
-    const bool mix_affine = params->algo == PL_FRAME_INTERP_MIX &&
-                            params->mix.fallback >= 6;
     motion_b_request = params->algo == PL_FRAME_INTERP_GATHER ? 1 :
                        params->algo == PL_FRAME_INTERP_MIX ? 2 : 0;
     motion_mix_request = params->mix;
@@ -4325,13 +3966,8 @@ bool pl_shader_frame_interp(pl_shader sh,
         return frame_interp_local(sh, input, params, &out_color);
     case PL_FRAME_INTERP_GATHER:
         return frame_interp_gather(sh, input, &out_color);
-    case PL_FRAME_INTERP_MIX: {
-        struct sh_motion_obj *obj = SH_OBJ_LOOKUP(*input->state, PL_SHADER_OBJ_MOTION,
-                                                  struct sh_motion_obj);
-        if (mix_affine && !motion_model_fit(input->gpu, input->dispatch, obj))
-            return false;
+    case PL_FRAME_INTERP_MIX:
         return frame_interp_mix(sh, input, &params->mix, &out_color);
-    }
     case PL_FRAME_INTERP_ALGO_COUNT:
         break;
     }
