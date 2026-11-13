@@ -496,7 +496,7 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 };
                 static const char *statics[] = {
                     "Off", "Zero vector", "Same in both frames",
-                    "Moves differently",
+                    "Moves differently", "Zero vector, textured",
                 };
                 static const char *cleans[] = {
                     "Off", "Median", "Median + minimum",
@@ -512,7 +512,7 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 mx->fallback = nk_combo(nk, fallbacks, 6, mx->fallback, 16,
                                         nk_vec2(nk_widget_width(nk), 300));
                 nk_label(nk, "Static test:", NK_TEXT_LEFT);
-                mx->static_test = nk_combo(nk, statics, 4, mx->static_test, 16,
+                mx->static_test = nk_combo(nk, statics, 5, mx->static_test, 16,
                                            nk_vec2(nk_widget_width(nk), 300));
                 nk_label(nk, "Quality cleaning:", NK_TEXT_LEFT);
                 mx->clean = nk_combo(nk, cleans, 3, mx->clean, 16,

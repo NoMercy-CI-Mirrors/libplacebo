@@ -385,8 +385,8 @@ struct pl_frame_interp_mix_params {
 
     // A moving V yields to plain frame mixing where it samples a static
     // pixel: 0 = never, 1 = a pixel whose vector is zero, 2 = a pixel that
-    // is the same in both frames, 3 = a pixel that moves differently from V
-    // (by 2 px for 1/e), static or not.
+    // is the same in both frames and not flat, 3 = a pixel that moves
+    // differently from V (by 2 px for 1/e), static or not, 4 = both 1 and 2.
     int static_test;
 
     // Tolerated mismatch between the two samples of the fallback candidates,
@@ -417,8 +417,8 @@ struct pl_frame_interp_mix_params {
     .q_vis = 1.0f, .q_cost_lo = 0.35f, .q_cost_hi = 0.8f, .q_outlier = 2.0f,   \
     .q_cost_flat = 6.0f, .q_border = 1.0f, .fill = true,                       \
     .clean = 1, .soften = 1.5f, .static_thresh = 1.0f, .pick = 2,              \
-    .consist = 2.0f, .fallback = 5, .static_test = 1, .sigma = 0.2f,           \
-    .giveup = 0.3f, .neigh = 4.0f, .sharp = true,
+    .consist = 2.0f, .fallback = 5, .static_test = 4, .sigma = 0.2f,           \
+    .giveup = 2.0f, .neigh = 4.0f, .sharp = true,
 
 // Tunable parameters. Kept separate from the per-call inputs so that callers
 // can reuse unchanging configurations.

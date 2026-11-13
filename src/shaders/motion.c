@@ -2185,7 +2185,7 @@ static void sh_median9(pl_shader sh)
 // those around it, or leaves the frame. See `pl_frame_interp_mix_params`.
 //
 // `qual` (y) is whether the pixel is static: its surroundings are the same in
-// both frames. The vectors are copied to `out`, or replaced by their median.
+// both frames, and not flat. The vectors are copied to `out`, or replaced by their median.
 static bool motion_quality_pass(pl_dispatch dp, pl_tex ref, pl_tex tgt,
                                 pl_tex flow, pl_tex vis, pl_tex out, pl_tex qual,
                                 const struct pl_frame_interp_mix_params *mp)
@@ -2257,6 +2257,15 @@ static bool motion_quality_pass(pl_dispatch dp, pl_tex ref, pl_tex tgt,
         if (leaves) \
             q = qleave; \
         float still = 1.0 - smoothstep(${float: 0.5f * thresh}, ${float: thresh}, sad / 9.0); \
+        /* a flat area is the same in both frames whether it moves or not */ \
+        for (int j = 0; j < 4; j++) { \
+            ivec2 o = (j & 2) == 0 ? ivec2(3, 0) : ivec2(0, 3); \
+            ivec2 p = clamp(pos + ((j & 1) == 0 ? o : -o), ivec2(0), size - 1); \
+            float d = texelFetch($ref_id, p, 0).r - centre; \
+            energy += d * d; \
+        } \
+        float flat2 = ${float: 13.0f * PL_SQUARE(PL_MAX(mp->q_cost_flat, 0.1f) / 255.0f)}; \
+        still *= energy / (energy + flat2); \
         imageStore($dst, pos, vec4(f, 0.0, 0.0)); \
         imageStore($qdst, pos, vec4(q, still, 0.0, 0.0)); \
     }
@@ -3719,7 +3728,7 @@ static bool frame_interp_mix(pl_shader sh,
         float ina = m_in(qa, fsz), inb = m_in(qb, fsz); \
         float q = min(mix(1.0, sa.x, ina), mix(1.0, sb.x, inb)) * max(ina, inb); \
         float still = 0.0; \
-        @if (consist || stest == 1 || stest == 3) { \
+        @if (consist || stest == 1 || stest >= 3) { \
         ivec2 ia = clamp(ivec2(floor(qa + 0.5)), ivec2(0), size - 1); \
         ivec2 ib = clamp(ivec2(floor(qb + 0.5)), ivec2(0), size - 1); \
         vec2 fa = texelFetch($fwd, ia, 0).xy, fb = texelFetch($bwd, ib, 0).xy; \
@@ -3729,6 +3738,8 @@ static bool frame_interp_mix(pl_shader sh,
             q *= exp(-differ * ${float: inv_consist}); \
         @if (stest == 3) \
             still = 1.0 - exp(-0.25 * differ); \
+        @if (stest == 4) \
+            still = max(exp(-4.0 * dot(fa, fa)) * sa.y, exp(-4.0 * dot(fb, fb)) * sb.y); \
         @if (stest == 1) \
             still = max(exp(-4.0 * dot(fa, fa)), exp(-4.0 * dot(fb, fb))); \
         @} \
