@@ -4092,6 +4092,7 @@ static bool frame_interp_mix(pl_shader sh,
     vec2 vs = vec2(0.0); \
     float ws = 0.0, qs = 0.0, v2 = 0.0; \
     float sf = 0.0, sg = 0.0; \
+    vec4 sc = vec4(0.5); \
     for (int k = 0; k < ${const int: ncand}; k++) { \
         @if (mask != 0) { \
         if (((${const int: mask} >> k) & 1) == 0) \
@@ -4137,6 +4138,7 @@ static bool frame_interp_mix(pl_shader sh,
         if (k == ${int: mp->stat_cand}) { \
             sf = wf; \
             sg = wk; \
+            sc = ck; \
         } \
         fs += wf * ck; \
         fw += wf; \
@@ -4169,6 +4171,7 @@ static bool frame_interp_mix(pl_shader sh,
         G = mix(gs / ws, G, agree); \
     /* fallback */ \
     vec4 F = mix(za, zb, t); \
+    vec4 plain = F; \
     vec2 V = vec2(0.0); \
     float still = 0.0, wv = 0.0; \
     float ef = abs(m_luma(za) - m_luma(zb)); \
@@ -4222,6 +4225,29 @@ static bool frame_interp_mix(pl_shader sh,
     if (${int: mp->stat_cand} >= ${const int: ncand}) \
         sf = ${float: mp->giveup}; \
     color = vec4((1.0 - Q) * sf / fden, Q * sg / ws, sf / fden, 1.0); \
+    @} \
+    @if ((show == 7 || show == 8) && neigh > 0) { \
+    /* the sample of one vector and its score in the fallback; past the */ \
+    /* last vector plain mixing, -1 the fallback, -2 the compensated sample */ \
+    float sw = clamp(sf, 0.0, 1.0); \
+    if (${int: mp->stat_cand} >= ${const int: ncand}) { \
+        sc = plain; \
+        sw = 1.0; \
+    } \
+    if (${int: mp->stat_cand} == -1) { \
+        sc = F; \
+        sw = 1.0; \
+    } \
+    if (${int: mp->stat_cand} == -2) { \
+        sc = G; \
+        sw = 1.0; \
+    } \
+    @if (show == 7) \
+        color = vec4(mix(vec3(0.5), sc.rgb, sw), 1.0); \
+    /* for measuring: 1 - Q in the integer part of alpha, the score in */ \
+    /* its fraction */ \
+    @if (show == 8) \
+        color = vec4(sc.rgb, floor((1.0 - Q) * 255.0) + 0.99 * sw); \
     @} \
     @if (show == 5) { \
     float differ = 1.0 - exp(-dot(vf - vb, vf - vb)); \

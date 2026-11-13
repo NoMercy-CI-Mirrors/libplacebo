@@ -484,7 +484,15 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 struct pl_frame_interp_mix_params *mx = &ipar->mix;
                 static const char *shows[] = {
                     "Result", "Quality Q", "Compensated sample", "Fallback",
-                    "Static veto / V", "Field picked",
+                    "Static veto / V", "Field picked", "Candidate: share",
+                    "Candidate: sample by score",
+                };
+                static const char *cands[] = {
+                    "Compensated sample", "Fallback", "Own, forward",
+                    "Own, backward", "Right, forward", "Right, backward",
+                    "Left, forward", "Left, backward", "Below, forward",
+                    "Below, backward", "Above, forward", "Above, backward",
+                    "None", "Block motion", "Affine", "Plain mixing",
                 };
                 static const char *picks[] = {
                     "Forward field", "Nearer frame", "Higher quality",
@@ -504,8 +512,22 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 };
                 nk_layout_row_dynamic(nk, 24, 2);
                 nk_label(nk, "Show:", NK_TEXT_LEFT);
-                mx->show = nk_combo(nk, shows, 6, mx->show, 16,
+                mx->show = nk_combo(nk, shows, 8, mx->show, 16,
                                     nk_vec2(nk_widget_width(nk), 300));
+                nk_label(nk, "Candidate:", NK_TEXT_LEFT);
+                mx->stat_cand = nk_combo(nk, cands, 16, mx->stat_cand + 2, 16,
+                                         nk_vec2(nk_widget_width(nk), 400)) - 2;
+                // which vectors take part (bits as for `stat_cand`)
+                unsigned mask = mx->cand_mask ? mx->cand_mask : 0x1FFF;
+                nk_layout_row_dynamic(nk, 24, 3);
+                nk_checkbox_flags_label(nk, "Own", &mask, 0x3);
+                nk_checkbox_flags_label(nk, "Neighbours fwd", &mask, 0x154);
+                nk_checkbox_flags_label(nk, "Neighbours bwd", &mask, 0x2A8);
+                nk_checkbox_flags_label(nk, "None", &mask, 0x400);
+                nk_checkbox_flags_label(nk, "Block", &mask, 0x800);
+                nk_checkbox_flags_label(nk, "Affine", &mask, 0x1000);
+                mx->cand_mask = mask == 0x1FFF ? 0 : mask;
+                nk_layout_row_dynamic(nk, 24, 2);
                 nk_label(nk, "Vector from:", NK_TEXT_LEFT);
                 mx->pick = nk_combo(nk, picks, 3, mx->pick, 16,
                                     nk_vec2(nk_widget_width(nk), 300));

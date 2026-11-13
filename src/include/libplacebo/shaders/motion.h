@@ -368,13 +368,16 @@ struct pl_frame_interp_mix_params {
     // the field the vector was taken from (red forward, blue backward), 6 =
     // the share of the vector `stat_cand` in the output through the fallback
     // (red), through the compensated sample (green), and in the fallback
-    // (blue).
+    // (blue), 7 = the sample of the vector `stat_cand`, faded to grey by its
+    // score in the fallback, 8 = that sample with the score in alpha, for
+    // measuring.
     int show;
 
     // For `show` = 6, with `neigh`: 0/1 = forward/backward field at the
     // pixel, 2-9 = those to the right, left, below and above, 10 = none, 11 =
     // block motion, 12 = affine, as far as `fallback` has them, anything
-    // higher = plain frame mixing.
+    // higher = plain frame mixing. For `show` = 7 and 8 also -1 = the
+    // fallback, -2 = the compensated sample.
     int stat_cand;
 
     // With `neigh`: bit mask of the vectors (numbered as for `stat_cand`) to
