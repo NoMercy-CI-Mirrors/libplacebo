@@ -3719,14 +3719,16 @@ static bool frame_interp_mix(pl_shader sh,
         float ina = m_in(qa, fsz), inb = m_in(qb, fsz); \
         float q = min(mix(1.0, sa.x, ina), mix(1.0, sb.x, inb)) * max(ina, inb); \
         float still = 0.0; \
-        @if (consist || stest == 1) { \
+        @if (consist || stest == 1 || stest == 3) { \
         ivec2 ia = clamp(ivec2(floor(qa + 0.5)), ivec2(0), size - 1); \
         ivec2 ib = clamp(ivec2(floor(qb + 0.5)), ivec2(0), size - 1); \
         vec2 fa = texelFetch($fwd, ia, 0).xy, fb = texelFetch($bwd, ib, 0).xy; \
-        @if (consist) { \
         vec2 da = fa - v, db = fb + v; \
-        q *= exp(-max(ina * dot(da, da), inb * dot(db, db)) * ${float: inv_consist}); \
-        @} \
+        float differ = max(ina * dot(da, da), inb * dot(db, db)); \
+        @if (consist) \
+            q *= exp(-differ * ${float: inv_consist}); \
+        @if (stest == 3) \
+            still = 1.0 - exp(-0.25 * differ); \
         @if (stest == 1) \
             still = max(exp(-4.0 * dot(fa, fa)), exp(-4.0 * dot(fb, fb))); \
         @} \
@@ -3853,7 +3855,9 @@ static bool frame_interp_mix(pl_shader sh,
         wv = exp(-max(ev1 * ev1 - ef * ef, 0.0) * ${float: inv_sigma}); \
     still *= 1.0 - exp(-4.0 * dot(V, V)); \
     wv *= 1.0 - still; \
-    F = mix(F, mix(fa, fb, t), wv); \
+    /* a sample out of the frame does not count */ \
+    float ua = (1.0 - t) * m_in(c0 - t * V, fsz), ub = t * m_in(c0 + (1.0 - t) * V, fsz); \
+    F = mix(F, ua + ub > 0.0 ? (ua * fa + ub * fb) / (ua + ub) : mix(fa, fb, t), wv); \
     ef = mix(ef, ev1, wv); \
     @} \
     @if (fallback >= 4 && neigh > 0) \

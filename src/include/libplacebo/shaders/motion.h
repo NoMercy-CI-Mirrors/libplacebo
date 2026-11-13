@@ -385,7 +385,8 @@ struct pl_frame_interp_mix_params {
 
     // A moving V yields to plain frame mixing where it samples a static
     // pixel: 0 = never, 1 = a pixel whose vector is zero, 2 = a pixel that
-    // is the same in both frames.
+    // is the same in both frames, 3 = a pixel that moves differently from V
+    // (by 2 px for 1/e), static or not.
     int static_test;
 
     // Tolerated mismatch between the two samples of the fallback candidates,
