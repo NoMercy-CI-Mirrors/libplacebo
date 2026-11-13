@@ -1515,9 +1515,12 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     const int w = out->params.w, h = out->params.h;
     const int grid_w = flow->params.w, grid_h = flow->params.h;
     const int win = MOTION_REFINE_WINDOW;
-    // Work groups cover at most one block, so they share the candidates
+    // Each block (or part of a block, for blocks larger than 16) is covered by
+    // `dim` x `dim` threads that share its candidates; a work group covers
+    // `g` x `g` of them.
     const int dim = PL_MIN(bs, 16), n = PL_DIV_UP(bs, dim);
-    // Squared differences over the windows of all pixels of the work group
+    const int g = n == 1 ? PL_MAX(16 / dim, 1) : 1;
+    // Squared differences over the windows of all pixels of a block
     const int tile = dim + win - 1;
     const int per_thread = PL_DIV_UP(PL_SQUARE(tile), PL_SQUARE(dim));
 
@@ -1525,8 +1528,8 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     sh_describef(sh, "motion vector refinement (%dx%d)", w, h);
     sh->output = PL_SHADER_SIG_NONE;
 
-    const size_t shmem = PL_SQUARE(tile) * sizeof(float);
-    if (!sh_try_compute(sh, dim, dim, false, shmem)) {
+    const size_t shmem = PL_SQUARE(g * tile) * sizeof(float);
+    if (!sh_try_compute(sh, g * dim, g * dim, false, shmem)) {
         PL_ERR(gpu,
                "pl_motion_estimate: cannot create motion vector refinement "
                "shader, needs %dx%d threads per work group!", dim, dim);
@@ -1550,20 +1553,23 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
 
     // clang-format off
 #pragma GLSLH /* motion_refine_pass */                                          \
-    shared float s_diff[${const int: tile * tile}];
+    shared float s_diff[${const int: g * g * tile * tile}];
 #pragma GLSL /* motion_refine_pass */                                           \
     ivec2 size  = ivec2(${const int: w}, ${const int: h});                      \
     ivec2 grid  = ivec2(${const int: grid_w}, ${const int: grid_h});            \
-    ivec2 local = ivec2(gl_LocalInvocationID.xy);                               \
-    ivec2 blk   = ivec2(gl_WorkGroupID.xy) / ${const int: n};                   \
-    ivec2 sub   = ivec2(gl_WorkGroupID.xy) % ${const int: n} * ${const int: dim}\
-                + local;                                                        \
+    ivec2 local = ivec2(gl_LocalInvocationID.xy) % ${const int: dim};           \
+    ivec2 gsub  = ivec2(gl_LocalInvocationID.xy) / ${const int: dim};           \
+    int sbase   = (gsub.y * ${const int: g} + gsub.x) * ${const int: tile * tile};\
+    int lidx    = local.y * ${const int: dim} + local.x;                        \
+    ivec2 wg    = ivec2(gl_WorkGroupID.xy);                                     \
+    ivec2 blk   = wg / ${const int: n} * ${const int: g} + gsub;                \
+    ivec2 sub   = wg % ${const int: n} * ${const int: dim} + local;             \
     ivec2 pos   = blk * ${const int: bs} + sub;                                 \
                                                                                 \
     float r[${const int: per_thread}];                                          \
     vec2 c[${const int: per_thread}];                                           \
     for (int l = 0; l < ${const int: per_thread}; l++) {                        \
-        int j = int(gl_LocalInvocationIndex) + l * ${const int: dim * dim};     \
+        int j = lidx + l * ${const int: dim * dim};     \
         ivec2 q = clamp(pos - local + ivec2(j % ${const int: tile},             \
                                             j / ${const int: tile})             \
                         - ${const int: win / 2}, ivec2(0), size - 1);           \
@@ -1583,15 +1589,15 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     @if (!plain) {                                                              \
     /* Texture energy of the window: its squared differences to its centre */   \
     for (int l = 0; l < ${const int: per_thread}; l++) {                        \
-        int j = int(gl_LocalInvocationIndex) + l * ${const int: dim * dim};     \
+        int j = lidx + l * ${const int: dim * dim};     \
         if (j < ${const int: tile * tile})                                      \
-            s_diff[j] = r[l];                                                   \
+            s_diff[sbase + j] = r[l];                                                   \
     }                                                                           \
     barrier();                                                                  \
-    float centre = s_diff[(local.y + ${const int: win / 2}) * ${const int: tile}\
+    float centre = s_diff[sbase + (local.y + ${const int: win / 2}) * ${const int: tile}\
                           + local.x + ${const int: win / 2}];                   \
     for (int j = 0; j < ${const int: win * win}; j++) {                         \
-        float d = s_diff[(local.y + j / ${const int: win}) * ${const int: tile} \
+        float d = s_diff[sbase + (local.y + j / ${const int: win}) * ${const int: tile} \
                          + local.x + j % ${const int: win}] - centre;           \
         energy += d * d;                                                        \
     }                                                                           \
@@ -1602,17 +1608,17 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     for (int k = 0; k < 9; k++) {                                               \
         barrier();                                                              \
         for (int l = 0; l < ${const int: per_thread}; l++) {                    \
-            int j = int(gl_LocalInvocationIndex) + l * ${const int: dim * dim}; \
+            int j = lidx + l * ${const int: dim * dim}; \
             vec2 pt = (c[l] + cand[k].xy) * $tgt_pt;                            \
             float d = r[l] - textureLod($tgt_id, pt, 0.0).r;                    \
             if (j < ${const int: tile * tile})                                  \
-                s_diff[j] = d * d;                                              \
+                s_diff[sbase + j] = d * d;                                              \
         }                                                                       \
         barrier();                                                              \
                                                                                 \
         float raw = 0.0;                                                        \
         for (int j = 0; j < ${const int: win * win}; j++) {                     \
-            raw += s_diff[(local.y + j / ${const int: win}) * ${const int: tile}\
+            raw += s_diff[sbase + (local.y + j / ${const int: win}) * ${const int: tile}\
                           + local.x + j % ${const int: win}];                   \
         }                                                                       \
         mean_ssd += raw / 9.0;                                                  \
@@ -1636,7 +1642,7 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
 
     const struct pl_dispatch_compute_params *params = pl_dispatch_compute_params(
         .shader        = &sh,
-        .dispatch_size = { grid_w * n, grid_h * n, 1 },
+        .dispatch_size = { PL_DIV_UP(grid_w * n, g), PL_DIV_UP(grid_h * n, g), 1 },
     );
 
     return pl_dispatch_compute(dispatch, params);
@@ -1663,8 +1669,8 @@ static int motion_b_request;
 #define MOTION_SUB 4
 
 // Rings of far candidates of the sub-block selection, at 2, 4, 8 and 16
-// blocks away in each of the 8 directions. They bring in motion that the
-// smoothing removed around thin objects.
+// blocks away along both axes. They bring in motion that the smoothing
+// removed around thin objects. (The diagonals were not worth their cost.)
 #define MOTION_SUB_RINGS 4
 
 // Per sub-block, the best of the block vectors around it (the 3x3 blocks
@@ -1676,13 +1682,16 @@ static bool motion_subsel_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
 {
     const int w = ref->params.w, h = ref->params.h;
     const int gw = out->params.w, gh = out->params.h;
-    const int S = MOTION_SUB, W = S + 2;
-    const int ncand = 9 + 8 * MOTION_SUB_RINGS;
+    const int S = MOTION_SUB, WIN = S + 2;
+    const int ncand = 9 + 4 * MOTION_SUB_RINGS;
 
     pl_shader sh = pl_dispatch_begin(dispatch);
     sh_describef(sh, "motion sub-block selection (%dx%d)", gw, gh);
     sh->output = PL_SHADER_SIG_NONE;
-    if (!sh_try_compute(sh, 8, 8, false, 0)) {
+    // A work group covers 8x8 sub-blocks, whose windows (with the border)
+    // are read from shared memory
+    const int T = 8 * S + 2, TT = T * T;
+    if (!sh_try_compute(sh, 8, 8, false, TT * sizeof(float))) {
         pl_dispatch_abort(dispatch, &sh);
         return false;
     }
@@ -1691,8 +1700,19 @@ static bool motion_subsel_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     ident_t tgt_id = bind_tex_linear(sh, "tgt", tgt);
     ident_t dst = bind_img(sh, "sub_out", out);
     // clang-format off
+#pragma GLSLH /* motion_subsel_pass */                                          \
+    shared float s_ref[${const int: TT}];
+
 #pragma GLSL /* motion_subsel_pass */                                           \
     ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 tile0 = ivec2(gl_WorkGroupID.xy) * ${const int: 8 * S} - 1;           \
+    for (int i = int(gl_LocalInvocationIndex); i < ${const int: TT}; i += 64) {\
+        ivec2 q = clamp(tile0 + ivec2(i % ${const int: T}, i / ${const int: T}),\
+                        ivec2(0), size - 1);                                    \
+        s_ref[i] = texelFetch($ref_id, q, 0).r;                                 \
+    }                                                                           \
+    barrier();                                                                  \
+    ivec2 lorg = ivec2(gl_LocalInvocationID.xy) * ${const int: S};              \
     ivec2 grid = ivec2(${const int: blocks->params.w}, ${const int: blocks->params.h});\
     ivec2 sb   = ivec2(gl_GlobalInvocationID.xy);                               \
     if (all(lessThan(sb, ivec2(${const int: gw}, ${const int: gh})))) {         \
@@ -1705,9 +1725,9 @@ static bool motion_subsel_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
         vec2 best = vec2(0.0), own = vec2(0.0), last = vec2(0.0);               \
         float best_cost = 1e9;                                                  \
         for (int k = 0; k < ${const int: ncand}; k++) {                         \
-            ivec2 o = near[k < 9 ? k : 1 + (k - 9) % 8];                        \
+            ivec2 o = near[k < 9 ? k : 2 + 2 * ((k - 9) & 3) - (((k - 9) & 3) >> 1)];\
             if (k >= 9)                                                         \
-                o *= 2 << ((k - 9) / 8);                                        \
+                o *= 2 << ((k - 9) >> 2);                                       \
             vec2 v = texelFetch($blk, clamp(cen / ${const int: bs} + o,         \
                                             ivec2(0), grid - 1), 0).xy;         \
             /* most candidates repeat the own, previous or best one */          \
@@ -1719,14 +1739,15 @@ static bool motion_subsel_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
                 own = v;                                                        \
             last = v;                                                           \
             float cost = 0.0;                                                   \
-            for (int i = 0; i < ${const int: W * W}; i++) {                     \
-                ivec2 q = clamp(org + ivec2(i % ${const int: W}, i / ${const int: W}) - 1,\
+            for (int i = 0; i < ${const int: WIN * WIN}; i++) {                     \
+                ivec2 q = clamp(org + ivec2(i % ${const int: WIN}, i / ${const int: WIN}) - 1,\
                                 ivec2(0), size - 1);                            \
-                float d = texelFetch($ref_id, q, 0).r                           \
+                ivec2 l = lorg + ivec2(i % ${const int: WIN}, i / ${const int: WIN});\
+                float d = s_ref[l.y * ${const int: T} + l.x]                    \
                         - textureLod($tgt_id, (vec2(q) + 0.5 + v) * pt, 0.0).r; \
                 cost += d * d * 255.0;                                          \
             }                                                                   \
-            cost = cost / float(${const int: W * W})                            \
+            cost = cost / float(${const int: WIN * WIN})                            \
                  + (k == 0 ? 0.0 : ${const float: 1.0f / 255.0f});              \
             if (cost < best_cost) {                                             \
                 best_cost = cost;                                               \
