@@ -3985,6 +3985,7 @@ static bool frame_interp_mix(pl_shader sh,
     const bool local = fallback == 2 || fallback == 3 || fallback == 5 || fallback == 7;
     const bool sharp = mp->sharp, affine = fallback >= 6;
     const int ncand = fallback == 7 ? 13 : fallback == 5 ? 12 : 10;
+    const int mask = mp->cand_mask & ((1 << ncand) - 1);
     if (affine) {
         bind_buf(sh, "motion_model_buf", obj->model.buf, PL_DESC_ACCESS_READONLY,
                  &model_var, 1);
@@ -4090,7 +4091,12 @@ static bool frame_interp_mix(pl_shader sh,
     float fw = 0.0; \
     vec2 vs = vec2(0.0); \
     float ws = 0.0, qs = 0.0, v2 = 0.0; \
+    float sf = 0.0, sg = 0.0; \
     for (int k = 0; k < ${const int: ncand}; k++) { \
+        @if (mask != 0) { \
+        if (((${const int: mask} >> k) & 1) == 0) \
+            continue; \
+        @} \
         ivec2 o = ivec2(0); \
         if (k >= 2) { \
             int j = (k - 2) >> 1; \
@@ -4128,6 +4134,10 @@ static bool frame_interp_mix(pl_shader sh,
         if (k == 12) \
             wf *= ${float: mp->affine}; \
         @} \
+        if (k == ${int: mp->stat_cand}) { \
+            sf = wf; \
+            sg = wk; \
+        } \
         fs += wf * ck; \
         fw += wf; \
         gs += wk * ck; \
@@ -4205,6 +4215,14 @@ static bool frame_interp_mix(pl_shader sh,
         color = F; \
     @if (show == 4) \
         color = vec4(still, 0.5 + V / 64.0, 1.0); \
+    @if (show == 6 && neigh > 0) { \
+    /* share of one vector (or, past the last, of plain mixing) in the */ \
+    /* output through F, through G, and in F */ \
+    float fden = fw + ${float: mp->giveup}; \
+    if (${int: mp->stat_cand} >= ${const int: ncand}) \
+        sf = ${float: mp->giveup}; \
+    color = vec4((1.0 - Q) * sf / fden, Q * sg / ws, sf / fden, 1.0); \
+    @} \
     @if (show == 5) { \
     float differ = 1.0 - exp(-dot(vf - vb, vf - vb)); \
     color = mix(vec4(vec3(0.3 * m_luma(G)), 1.0), \
