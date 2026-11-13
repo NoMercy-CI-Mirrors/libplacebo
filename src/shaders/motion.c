@@ -1667,19 +1667,6 @@ static int motion_b_request;
 // smoothing removed around thin objects.
 #define MOTION_SUB_RINGS 4
 
-// EXPERIMENT (ablation): tunables read from the environment
-static float b_envf(const char *name, float def)
-{
-    const char *v = getenv(name);
-    return v ? atof(v) : def;
-}
-
-static int dc_env(const char *name, int def)
-{
-    const char *v = getenv(name);
-    return v ? atoi(v) : def;
-}
-
 // Per sub-block, the best of the block vectors around it (the 3x3 blocks
 // around the sub-block and MOTION_SUB_RINGS rings further away), by the SSD
 // over the sub-block and a one pixel border. The sub-block's own block
@@ -1690,8 +1677,7 @@ static bool motion_subsel_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
     const int w = ref->params.w, h = ref->params.h;
     const int gw = out->params.w, gh = out->params.h;
     const int S = MOTION_SUB, W = S + 2;
-    const int rings = dc_env("G_FAR", 1) ? MOTION_SUB_RINGS : 0;
-    const int ncand = 9 + 8 * rings;
+    const int ncand = 9 + 8 * MOTION_SUB_RINGS;
 
     pl_shader sh = pl_dispatch_begin(dispatch);
     sh_describef(sh, "motion sub-block selection (%dx%d)", gw, gh);
@@ -1754,28 +1740,6 @@ static bool motion_subsel_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
         .shader = &sh, .dispatch_size = { PL_DIV_UP(gw, 8), PL_DIV_UP(gh, 8), 1 }));
 }
 
-// EXPERIMENT (ablation): nearest upsampling of the sub-block field, in place
-// of the per pixel refinement
-static bool motion_upsample_pass(pl_gpu gpu, pl_dispatch dispatch, int S,
-                                 pl_tex sub, pl_tex out)
-{
-    pl_shader sh = pl_dispatch_begin(dispatch);
-    sh_describe(sh, "motion sub-block upsampling");
-    sh->output = PL_SHADER_SIG_NONE;
-    if (!sh_try_compute(sh, 16, 16, false, 0)) {
-        pl_dispatch_abort(dispatch, &sh);
-        return false;
-    }
-    ident_t src = bind_tex(sh, "sub", sub);
-    ident_t dst = bind_img(sh, "up_out", out);
-#pragma GLSL /* upsample */                                                     \
-    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);                                \
-    if (all(lessThan(pos, ivec2(${const int: out->params.w}, ${const int: out->params.h}))))\
-        imageStore($dst, pos, vec4(texelFetch($src, pos / ${const int: S}, 0).xy, 1.0, 0.0));
-    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
-        .shader = &sh, .dispatch_size = { PL_DIV_UP(out->params.w, 16), PL_DIV_UP(out->params.h, 16), 1 }));
-}
-
 // Marks the pixels of `flow` that are hidden in the other frame, in the z
 // channel of `out` (visibility, hidden below 0.5). A pixel is hidden if
 // following its vector and then the opposite field's (`opp`, the best of the
@@ -1786,7 +1750,6 @@ static bool motion_occlusion_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
                                   pl_tex flow, pl_tex opp, pl_tex out)
 {
     const int w = out->params.w, h = out->params.h;
-    const bool occ = dc_env("G_OCC", 1), photo = dc_env("G_OCCPH", 1);
     pl_shader sh = pl_dispatch_begin(dispatch);
     sh_describef(sh, "motion occlusion (%dx%d)", w, h);
     sh->output = PL_SHADER_SIG_NONE;
@@ -1806,8 +1769,6 @@ static bool motion_occlusion_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
     if (all(lessThan(pos, size))) {                                             \
         vec2 pt = 1.0 / vec2(size);                                             \
         vec2 f = texelFetch($src, pos, 0).xy;                                   \
-        float vis = 1.0;                                                        \
-        @if (occ) {                                                             \
         vec2 rt = f + textureLod($opp_id, (vec2(pos) + 0.5 + f) * pt, 0.0).xy;  \
         ivec2 base = ivec2(floor(vec2(pos) + f));                               \
         for (int i = 0; i < 4; i++) {                                           \
@@ -1816,8 +1777,7 @@ static bool motion_occlusion_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
             if (dot(r2, r2) < dot(rt, rt))                                      \
                 rt = r2;                                                        \
         }                                                                       \
-        vis = 1.0 / (1.0 + dot(rt, rt) / 2.25);                                 \
-        @if (photo) {                                                           \
+        float vis = 1.0 / (1.0 + dot(rt, rt) / 2.25);                           \
         if (vis < 0.5) {                                                        \
             float centre = texelFetch($ref_id, pos, 0).r;                       \
             float ssd = 0.0, energy = 0.0;                                      \
@@ -1831,8 +1791,6 @@ static bool motion_occlusion_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
             float m = ssd / (energy + ${const float: 9.0f / (255.0f * 255.0f)}) / 0.04;\
             vis = max(vis, 1.0 / (1.0 + m * m));                                \
         }                                                                       \
-        @}                                                                      \
-        @}                                                                      \
         imageStore($dst, pos, vec4(f, vis, 0.0));                               \
     }
     // clang-format on
@@ -1852,7 +1810,6 @@ static bool motion_fill_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
                              pl_tex tgt, pl_tex flow, pl_tex out)
 {
     const int w = out->params.w, h = out->params.h;
-    const bool fill = dc_env("G_FILL", 1);
     pl_shader sh = pl_dispatch_begin(dispatch);
     sh_describef(sh, "motion vector fill (%dx%d)", w, h);
     sh->output = PL_SHADER_SIG_NONE;
@@ -1872,7 +1829,6 @@ static bool motion_fill_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
     if (all(lessThan(pos, size))) {                                             \
         vec4 f = texelFetch($src, pos, 0);                                      \
         float centre = texelFetch($ref_id, pos, 0).r;                           \
-        @if (fill) {                                                            \
         if (f.z < 0.5) {                                                        \
             /* Distances along the axes, and along the diagonals */             \
             const int ax[9] = int[9](1, 2, 3, 5, 8, 12, 16, 24, 32);            \
@@ -1912,7 +1868,6 @@ static bool motion_fill_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
                 }                                                               \
             }                                                                   \
         }                                                                       \
-        @}                                                                      \
                                                                                 \
         float ssd = 0.0, energy = 0.0;                                          \
         for (int j = 0; j < 9; j++) {                                           \
@@ -1993,14 +1948,11 @@ static bool motion_layer_pass(pl_dispatch dp, pl_tex fields[2], pl_buf mark,
 
 // What the interpolation reads of each field: `out[d]` = (dx, dy, front,
 // cost). `front` is the layer mark. `cost` measures how badly the field
-// explains the pixel, in 1/1024 of `motion_fill_pass`'s mismatch (0-254); a
-// pixel hidden in the other frame counts 64 if it lands on a visible pixel
-// there, 255 if it lands on another hidden one.
+// explains the pixel: `motion_fill_pass`'s mismatch, times 1024 (0-254).
 static bool motion_pack_pass(pl_dispatch dp, pl_tex fields[2], pl_buf mark,
                              unsigned stamp, pl_tex out[2])
 {
     const int w = fields[0]->params.w, h = fields[0]->params.h;
-    const bool layer = dc_env("G_LAYER", 1), qhid = dc_env("G_QHID", 1);
     struct pl_buffer_var mark_var = uint_array_var("layer_mark", 1, 2 * (size_t) w * h);
     pl_shader sh = pl_dispatch_begin(dp);
     sh_describe(sh, "motion field packing");
@@ -2013,8 +1965,7 @@ static bool motion_pack_pass(pl_dispatch dp, pl_tex fields[2], pl_buf mark,
     ident_t bwd = bind_tex(sh, "flow_bwd", fields[1]);
     ident_t ofwd = bind_img(sh, "pack_fwd", out[0]);
     ident_t obwd = bind_img(sh, "pack_bwd", out[1]);
-    if (layer)
-        bind_buf(sh, "layer_mark_buf", mark, PL_DESC_ACCESS_READONLY, &mark_var, 1);
+    bind_buf(sh, "layer_mark_buf", mark, PL_DESC_ACCESS_READONLY, &mark_var, 1);
     // clang-format off
 #pragma GLSL /* motion_pack_pass */                                             \
     ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
@@ -2024,18 +1975,7 @@ static bool motion_pack_pass(pl_dispatch dp, pl_tex fields[2], pl_buf mark,
             break;                                                              \
         vec4 f = d == 0 ? texelFetch($fwd, pos, 0) : texelFetch($bwd, pos, 0);  \
         float cost = floor(min(f.w * 1024.0, 254.0));                           \
-        @if (qhid) {                                                            \
-        if (f.z < 0.5) {                                                        \
-            ivec2 q = ivec2(floor(vec2(pos) + f.xy + 0.5));                     \
-            if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, size))) { \
-                float ov = d == 0 ? texelFetch($bwd, q, 0).z : texelFetch($fwd, q, 0).z;\
-                cost = ov >= 0.5 ? 64.0 : 255.0;                                \
-            }                                                                   \
-        }                                                                       \
-        @}                                                                      \
-        float front = 0.0;                                                      \
-        @if (layer)                                                             \
-            front = layer_mark[(d * size.y + pos.y) * size.x + pos.x] == ${uint: stamp} ? 1.0 : 0.0;\
+        float front = layer_mark[(d * size.y + pos.y) * size.x + pos.x] == ${uint: stamp} ? 1.0 : 0.0;\
         vec4 res = vec4(f.xy, front, cost);                                     \
         if (d == 0)                                                             \
             imageStore($ofwd, pos, res);                                        \
@@ -2341,7 +2281,7 @@ static bool motion_b_post(pl_gpu gpu, pl_dispatch dispatch,
                              PL_DIV_UP(h, qb), dense[0]->params.format))
         return false;
     const unsigned stamp = ++obj->gather.pair;
-    if (dc_env("G_LAYER", 1) && !motion_layer_pass(dispatch, dense, obj->gather.mark, stamp))
+    if (!motion_layer_pass(dispatch, dense, obj->gather.mark, stamp))
         return false;
     return motion_pack_pass(dispatch, dense, obj->gather.mark, stamp, obj->gather.packed) &&
            motion_quality_pass(dispatch, obj->gather.packed, obj->gather.quality);
@@ -2571,17 +2511,14 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
         pl_tex prev = obj->scratch.filtered.elem[0];
         pl_tex ra = fwd ? obj->pyramid_prev.elem[0] : obj->scratch.levels.elem[0];
         pl_tex rb = fwd ? obj->scratch.levels.elem[0] : obj->pyramid_prev.elem[0];
-        if (bmode && dc_env("G_SUBSEL", 1)) {
+        if (bmode) {
             const int S = MOTION_SUB;
             ok = ok && dense_flow_recreate(gpu, &obj->b_sub[d], PL_DIV_UP(w, S),
                                            PL_DIV_UP(h, S), mv_fmt) &&
                  motion_subsel_pass(gpu, input->dispatch, params->block_size,
                                     ra, rb, prev, obj->b_sub[d]) &&
-                 (dc_env("G_REFINE", 1)
-                  ? motion_refine_pass(gpu, input->dispatch, S, ra, rb,
-                                       obj->b_sub[d], obj->b_sel[d], true)
-                  : motion_upsample_pass(gpu, input->dispatch, S, obj->b_sub[d],
-                                         obj->b_sel[d]));
+                 motion_refine_pass(gpu, input->dispatch, S, ra, rb,
+                                    obj->b_sub[d], obj->b_sel[d], true);
         } else {
             ok = ok && motion_refine_pass(gpu, input->dispatch, params->block_size,
                                           ra, rb, prev,
@@ -3125,6 +3062,10 @@ static bool frame_interp_local(pl_shader sh,
 // best candidate, in the square root of the luma.
 #define MOTION_GATHER_SIGMA 0.2f
 
+// Weight of plain frame mixing, as far as the candidates' weights sum to less
+// than 1.
+#define MOTION_GATHER_FALLBACK 0.05f
+
 static bool frame_interp_gather(pl_shader sh,
                                 const struct pl_frame_interp_input *input,
                                 const struct pl_color_space *out_color)
@@ -3205,12 +3146,6 @@ static bool frame_interp_gather(pl_shader sh,
     ident_t fwd = bind_tex(sh, "g_fwd", packed[0]);
     ident_t bwd = bind_tex(sh, "g_bwd", packed[1]);
     ident_t qmap = bind_tex(sh, "g_qual", qual);
-    // EXPERIMENT (ablation)
-    const bool veto = dc_env("G_VETO", 1), use_gate = dc_env("G_GATE", 1);
-    const float beta = b_envf("G_BETA", MOTION_GATHER_FRONT);
-    const float sigma = b_envf("G_SIGMA", MOTION_GATHER_SIGMA);
-    const bool sharp = dc_env("G_SHARP", 1);
-    const float fallback = b_envf("G_FB", 0.05f);
     const float isv = 1.0f / PL_SQUARE(MOTION_GATHER_VETO);
     // clang-format off
 #pragma GLSLH /* frame_interp_gather */                                         \
@@ -3235,7 +3170,7 @@ static bool frame_interp_gather(pl_shader sh,
     vec2 P = pa * fsz;                                                          \
     vec2 c0 = P - 0.5;                                                          \
     float gate = 1.0;                                                           \
-    @if (use_gate) {                                                            \
+    {                                                                           \
         vec2 qg = P / ${const float: MOTION_QUALITY_BLOCK} - 0.5;               \
         ivec2 q0 = ivec2(floor(qg));                                            \
         vec2 qf = qg - vec2(q0);                                                \
@@ -3248,7 +3183,7 @@ static bool frame_interp_gather(pl_shader sh,
         }                                                                       \
         gate = 1.0 - smoothstep(${const float: MOTION_GATHER_QLO},              \
                                 ${const float: MOTION_GATHER_QHI}, qv);         \
-    @}                                                                          \
+    }                                                                           \
     vec2 grid = P / ${const float: MOTION_GATHER_PITCH} - 0.5;                  \
     vec2 base = floor(grid), frac = grid - base;                                \
     vec4 ck[8]; vec2 vk[8], sk[8]; float wk[8], ek[8];                          \
@@ -3265,19 +3200,17 @@ static bool frame_interp_gather(pl_shader sh,
         float va = g_in(qa, fsz), vb = g_in(qb, fsz);                           \
         vec4 fa = texelFetch($fwd, clamp(ivec2(floor(qa + 0.5)), ivec2(0), size - 1), 0);\
         vec4 fb = texelFetch($bwd, clamp(ivec2(floor(qb + 0.5)), ivec2(0), size - 1), 0);\
-        @if (veto) {                                                            \
-            vec2 da = fa.xy - v, db = fb.xy + v;                                \
-            va *= 1.0 - gate * (1.0 - exp(-dot(da, da) * ${const float: isv})); \
-            vb *= 1.0 - gate * (1.0 - exp(-dot(db, db) * ${const float: isv})); \
-            wt *= ${const float: MOTION_GATHER_FLOOR}                           \
-                + ${const float: 1.0f - MOTION_GATHER_FLOOR} * max(va, vb);     \
-        @}                                                                      \
-        wt *= exp(${float: beta} * gate * max(fa.z * va, fb.z * vb));           \
+        vec2 da = fa.xy - v, db = fb.xy + v;                                    \
+        va *= 1.0 - gate * (1.0 - exp(-dot(da, da) * ${const float: isv}));     \
+        vb *= 1.0 - gate * (1.0 - exp(-dot(db, db) * ${const float: isv}));     \
+        wt *= ${const float: MOTION_GATHER_FLOOR}                               \
+            + ${const float: 1.0f - MOTION_GATHER_FLOOR} * max(va, vb);         \
+        wt *= exp(${const float: MOTION_GATHER_FRONT} * gate * max(fa.z * va, fb.z * vb));\
         vec4 ca = g_sa((qa + 0.5) * isz), cb = g_sb((qb + 0.5) * isz);          \
         float wa = (1.0 - t) * va, wb = t * vb;                                 \
         ek[k] = wa > 0.0 && wb > 0.0                                            \
-              ? mix(${float: sigma}, abs(g_luma(ca) - g_luma(cb)), min(va, vb)) \
-              : ${float: sigma};                                                \
+              ? mix(${const float: MOTION_GATHER_SIGMA}, abs(g_luma(ca) - g_luma(cb)), min(va, vb)) \
+              : ${const float: MOTION_GATHER_SIGMA};                                                \
         ck[k] = wa + wb > 1e-6 ? (wa * ca + wb * cb) / (wa + wb) : mix(ca, cb, t);\
         vk[k] = v; wk[k] = wt; sk[k] = vec2(va, vb);                            \
     }                                                                           \
@@ -3286,11 +3219,10 @@ static bool frame_interp_gather(pl_shader sh,
         if (wk[k] > 0.0) emin = min(emin, ek[k]);                               \
     float sum = 0.0; vec4 mc = vec4(0.0); vec2 mv = vec2(0.0), ms = vec2(0.0);   \
     for (int k = 0; k < 8; k++) {                                               \
-        @if (sigma > 0.0)                                                       \
-            wk[k] *= exp((emin * emin - ek[k] * ek[k]) / ${const float: PL_MAX(sigma * sigma, 1e-8f)});\
+        wk[k] *= exp((emin * emin - ek[k] * ek[k])                              \
+                     * ${const float: 1.0f / PL_SQUARE(MOTION_GATHER_SIGMA)});  \
         sum += wk[k]; mc += wk[k] * ck[k]; mv += wk[k] * vk[k]; ms += wk[k] * sk[k];\
     }                                                                           \
-    @if (sharp) {                                                               \
     if (sum > 1e-6) {                                                           \
         mv /= sum; ms /= sum;                                                   \
         float var = 0.0;                                                        \
@@ -3309,8 +3241,7 @@ static bool frame_interp_gather(pl_shader sh,
             mc = mix(mc, sum * cp, agree);                                      \
         }                                                                       \
     }                                                                           \
-    @}                                                                          \
-    float fbw = ${float: fallback} * max(1.0 - sum, 0.0);                       \
+    float fbw = ${const float: MOTION_GATHER_FALLBACK} * max(1.0 - sum, 0.0);                       \
     color = mix(g_sa(pa), g_sb(pb), t);                                         \
     if (sum + fbw > 1e-6)                                                       \
         color = (mc + fbw * color) / (sum + fbw);                               \
