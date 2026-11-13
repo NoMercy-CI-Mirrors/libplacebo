@@ -1738,15 +1738,20 @@ static bool motion_subsel_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
             if (k == 0)                                                         \
                 own = v;                                                        \
             last = v;                                                           \
-            float cost = 0.0;                                                   \
-            for (int i = 0; i < ${const int: WIN * WIN}; i++) {                     \
-                ivec2 q = clamp(org + ivec2(i % ${const int: WIN}, i / ${const int: WIN}) - 1,\
-                                ivec2(0), size - 1);                            \
-                ivec2 l = lorg + ivec2(i % ${const int: WIN}, i / ${const int: WIN});\
-                float d = s_ref[l.y * ${const int: T} + l.x]                    \
-                        - textureLod($tgt_id, (vec2(q) + 0.5 + v) * pt, 0.0).r; \
-                cost += d * d * 255.0;                                          \
-            }                                                                   \
+            float cost = 0.0, d;                                                \
+            ivec2 q;                                                            \
+            int l0 = lorg.y * ${const int: T} + lorg.x;                         \
+            @for (y < WIN) {                                                    \
+                @for (x < WIN) {                                                \
+                    q = clamp(org + ivec2(@x - 1, @y - 1), ivec2(0), size - 1); \
+                    d = s_ref[l0 + @y * ${const int: T} + @x]                   \
+                      - textureLod($tgt_id, (vec2(q) + 0.5 + v) * pt, 0.0).r;   \
+                    cost += d * d * 255.0;                                      \
+                @}                                                              \
+                /* the cost only grows: stop once this candidate lost */        \
+                if (cost >= best_cost * float(${const int: WIN * WIN}))         \
+                    continue;                                                   \
+            @}                                                                  \
             cost = cost / float(${const int: WIN * WIN})                            \
                  + (k == 0 ? 0.0 : ${const float: 1.0f / 255.0f});              \
             if (cost < best_cost) {                                             \
