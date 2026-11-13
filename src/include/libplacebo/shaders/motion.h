@@ -168,6 +168,12 @@ PL_API void pl_motion_reset(pl_shader_obj state);
 PL_API pl_tex pl_motion_get_flow(pl_shader_obj state,
                                  enum pl_motion_direction dir);
 
+// EXPERIMENT: replace what the gather interpolation reads for `dir` (0 fwd,
+// 1 bwd) after an estimation: the vectors (rg16f, one per pixel) and the
+// front marks (u8, nonzero = in front). Also trusts the fields fully.
+PL_API bool pl_motion_debug_gather_set(pl_shader_obj state, int dir,
+                                       const void *flow, const uint8_t *front);
+
 // Returns the buffer holding the global motion vector in the direction `dir`
 // or NULL if no `pl_motion_estimate` call for the current frame pair set
 // `estimate_global`, if it did not compute `dir`, or if no estimation has

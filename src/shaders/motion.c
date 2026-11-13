@@ -708,6 +708,36 @@ int pl_motion_num_blocks(int w, int h,
     return PL_DIV_UP(w, bs) * PL_DIV_UP(h, bs);
 }
 
+bool pl_motion_debug_gather_set(pl_shader_obj state, int dir,
+                                const void *flow, const uint8_t *front)
+{
+    struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
+                                              struct sh_motion_obj);
+    if (!obj || !obj->gather.front[dir] || !obj->gather.quality)
+        return false;
+    pl_gpu gpu = state->gpu;
+    pl_tex ft = dir ? obj->flow.dense_bwd : obj->flow.dense_fwd;
+    pl_tex mt = obj->gather.front[dir], qt = obj->gather.quality;
+    if (ft->params.format->texel_size != 4)
+        return false;
+    const size_t n = (size_t) mt->params.w * mt->params.h;
+    const size_t mts = mt->params.format->texel_size;
+    uint8_t *tmp = pl_zalloc(NULL, PL_MAX(n * mts, (size_t) qt->params.w * qt->params.h *
+                                                 qt->params.format->texel_size));
+    for (size_t i = 0; i < n; i++) {
+        if (mts == 1)
+            tmp[i] = front[i] ? 255 : 0;
+        else
+            ((uint16_t *) tmp)[i] = front[i] ? 0x3C00 : 0; // half 1.0
+    }
+    bool ok = pl_tex_upload(gpu, pl_tex_transfer_params(.tex = ft, .ptr = (void *) flow)) &&
+              pl_tex_upload(gpu, pl_tex_transfer_params(.tex = mt, .ptr = tmp));
+    memset(tmp, 0, (size_t) qt->params.w * qt->params.h * qt->params.format->texel_size);
+    ok = ok && pl_tex_upload(gpu, pl_tex_transfer_params(.tex = qt, .ptr = tmp));
+    pl_free(tmp);
+    return ok;
+}
+
 void pl_motion_reset(pl_shader_obj state)
 {
     struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
