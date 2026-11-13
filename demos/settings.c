@@ -523,6 +523,8 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                                   1.0f, 0.01f, 0.001f);
                 nk_property_float(nk, "Consistency (px)", 0.0f, &mx->consist,
                                   16.0f, 0.1f, 0.01f);
+                nk_property_float(nk, "Plain mixing weight", 0.0f, &mx->giveup,
+                                  4.0f, 0.01f, 0.001f);
                 nk_property_float(nk, "Photometric veto", 0.0f, &mx->veto,
                                   1.0f, 0.01f, 0.001f);
                 nk_checkbox_label(nk, "Bicubic sample", &mx->sharp);

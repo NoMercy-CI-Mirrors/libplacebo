@@ -393,6 +393,11 @@ struct pl_frame_interp_mix_params {
     // for `fallback` = 3, as a difference in the square root of their luma.
     float sigma;
 
+    // For `fallback` >= 4: weight of plain frame mixing next to the vectors,
+    // each of which weighs up to 1. Where the frames agree along none of
+    // them, or `static_test` rejects them, this is what remains.
+    float giveup;
+
     // Difference, in the square root of the luma, between the two
     // compensated samples at which Q falls to 1/e, beyond the difference
     // between the two samples of the fallback. 0 disables this.
@@ -413,7 +418,7 @@ struct pl_frame_interp_mix_params {
     .q_cost_flat = 6.0f, .q_border = 1.0f, .fill = true,                       \
     .clean = 1, .soften = 1.5f, .static_thresh = 1.0f, .pick = 2,              \
     .consist = 2.0f, .fallback = 5, .static_test = 1, .sigma = 0.2f,           \
-    .neigh = 4.0f, .sharp = true,
+    .giveup = 0.3f, .neigh = 4.0f, .sharp = true,
 
 // Tunable parameters. Kept separate from the per-call inputs so that callers
 // can reuse unchanging configurations.

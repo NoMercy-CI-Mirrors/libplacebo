@@ -3801,8 +3801,10 @@ static bool frame_interp_mix(pl_shader sh,
         float wk = (ek.x + 0.02) * exp(-ph * ph * ${float: inv_sigma}) + 1e-9; \
         float ua = (1.0 - t) * ia, ub = t * ib; \
         vec4 ck = ua + ub > 0.0 ? (ua * ca + ub * cb) / (ua + ub) : mix(ca, cb, t); \
-        /* for the fallback, by the agreement alone */ \
-        float wf = exp(-ph * ph * ${float: inv_sigma}) + 1e-9; \
+        /* for the fallback, by the agreement alone, less what the static */ \
+        /* test rejects */ \
+        float wf = exp(-ph * ph * ${float: inv_sigma}) \
+                 * (1.0 - ek.y * (1.0 - exp(-4.0 * dot(vk, vk)))) + 1e-9; \
         fs += wf * ck; \
         fw += wf; \
         gs += wk * ck; \
@@ -3861,7 +3863,7 @@ static bool frame_interp_mix(pl_shader sh,
     ef = mix(ef, ev1, wv); \
     @} \
     @if (fallback >= 4 && neigh > 0) \
-        F = fs / fw; \
+        F = (fs + ${float: mp->giveup} * F) / (fw + ${float: mp->giveup}); \
     @if (veto) { \
     float eg = max(abs(m_luma(ga) - m_luma(gb)) - ef, 0.0); \
     Q *= exp(-eg * eg * ${float: inv_veto}); \
