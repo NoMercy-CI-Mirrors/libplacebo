@@ -1967,18 +1967,26 @@ static bool motion_layer_pass(pl_dispatch dp, pl_tex fields[2], pl_buf mark,
         .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(h, 16), 1 }));
 }
 
+// Block size of the field quality map.
+#define MOTION_QUALITY_BLOCK 8
+
 // What the interpolation reads of each field: `out[d]` = (dx, dy, front,
 // cost). `front` is the layer mark. `cost` measures how badly the field
 // explains the pixel: `motion_fill_pass`'s mismatch, times 1024 (0-254).
+//
+// Also writes the field quality map `qual`: the mean cost of both fields per
+// MOTION_QUALITY_BLOCK square block, i.e. how well the fields explain the
+// frames around there, which decides how far the interpolation trusts them.
 static bool motion_pack_pass(pl_dispatch dp, pl_tex fields[2], pl_buf mark,
-                             unsigned stamp, pl_tex out[2])
+                             unsigned stamp, pl_tex out[2], pl_tex qual)
 {
     const int w = fields[0]->params.w, h = fields[0]->params.h;
+    const int qb = MOTION_QUALITY_BLOCK;
     struct pl_buffer_var mark_var = uint_array_var("layer_mark", 1, 2 * (size_t) w * h);
     pl_shader sh = pl_dispatch_begin(dp);
     sh_describe(sh, "motion field packing");
     sh->output = PL_SHADER_SIG_NONE;
-    if (!sh_try_compute(sh, 16, 16, false, 0)) {
+    if (!sh_try_compute(sh, qb, qb, false, 2 * qb * qb * sizeof(float))) {
         pl_dispatch_abort(dp, &sh);
         return false;
     }
@@ -1986,69 +1994,46 @@ static bool motion_pack_pass(pl_dispatch dp, pl_tex fields[2], pl_buf mark,
     ident_t bwd = bind_tex(sh, "flow_bwd", fields[1]);
     ident_t ofwd = bind_img(sh, "pack_fwd", out[0]);
     ident_t obwd = bind_img(sh, "pack_bwd", out[1]);
+    ident_t qdst = bind_img(sh, "quality", qual);
     bind_buf(sh, "layer_mark_buf", mark, PL_DESC_ACCESS_READONLY, &mark_var, 1);
     // clang-format off
+#pragma GLSLH /* motion_pack_pass */                                            \
+    shared float s_cost[${const int: 2 * qb * qb}];
+
 #pragma GLSL /* motion_pack_pass */                                             \
     ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
     ivec2 pos  = ivec2(gl_GlobalInvocationID.xy);                               \
+    int tid    = int(gl_LocalInvocationIndex);                                  \
+    bool inside = all(lessThan(pos, size));                                     \
     for (int d = 0; d < 2; d++) {                                               \
-        if (any(greaterThanEqual(pos, size)))                                   \
-            break;                                                              \
-        vec4 f = d == 0 ? texelFetch($fwd, pos, 0) : texelFetch($bwd, pos, 0);  \
-        float cost = floor(min(f.w * 1024.0, 254.0));                           \
-        float front = layer_mark[(d * size.y + pos.y) * size.x + pos.x] == ${uint: stamp} ? 1.0 : 0.0;\
-        vec4 res = vec4(f.xy, front, cost);                                     \
-        if (d == 0)                                                             \
-            imageStore($ofwd, pos, res);                                        \
-        else                                                                    \
-            imageStore($obwd, pos, res);                                        \
+        float cost = 0.0;                                                       \
+        if (inside) {                                                           \
+            vec4 f = d == 0 ? texelFetch($fwd, pos, 0) : texelFetch($bwd, pos, 0);\
+            cost = floor(min(f.w * 1024.0, 254.0));                             \
+            float front = layer_mark[(d * size.y + pos.y) * size.x + pos.x]     \
+                          == ${uint: stamp} ? 1.0 : 0.0;                        \
+            vec4 res = vec4(f.xy, front, cost);                                 \
+            if (d == 0)                                                         \
+                imageStore($ofwd, pos, res);                                    \
+            else                                                                \
+                imageStore($obwd, pos, res);                                    \
+        }                                                                       \
+        s_cost[d * ${const int: qb * qb} + tid] = cost;                         \
+    }                                                                           \
+    barrier();                                                                  \
+    if (tid == 0) {                                                             \
+        ivec2 org = ivec2(gl_WorkGroupID.xy) * ${const int: qb};                \
+        ivec2 n = min(size - org, ivec2(${const int: qb}));                     \
+        float acc = 0.0;                                                        \
+        for (int i = 0; i < ${const int: 2 * qb * qb}; i++)                     \
+            acc += s_cost[i];                                                   \
+        imageStore($qdst, ivec2(gl_WorkGroupID.xy),                             \
+                   vec4(acc / float(2 * n.x * n.y), 0.0, 0.0, 0.0));            \
     }
     // clang-format on
     return pl_dispatch_compute(dp, pl_dispatch_compute_params(
         .shader = &sh,
-        .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(h, 16), 1 }));
-}
-
-// Block size of the field quality map.
-#define MOTION_QUALITY_BLOCK 8
-
-// Mean cost of both packed fields per MOTION_QUALITY_BLOCK square block: how
-// well the fields explain the frames around there, which decides how far the
-// interpolation trusts them.
-static bool motion_quality_pass(pl_dispatch dp, pl_tex packed[2], pl_tex out)
-{
-    const int w = packed[0]->params.w, h = packed[0]->params.h;
-    const int gw = out->params.w, gh = out->params.h, qb = MOTION_QUALITY_BLOCK;
-    pl_shader sh = pl_dispatch_begin(dp);
-    sh_describe(sh, "motion field quality");
-    sh->output = PL_SHADER_SIG_NONE;
-    if (!sh_try_compute(sh, 8, 8, false, 0)) {
-        pl_dispatch_abort(dp, &sh);
-        return false;
-    }
-    ident_t fwd = bind_tex(sh, "pack_fwd", packed[0]);
-    ident_t bwd = bind_tex(sh, "pack_bwd", packed[1]);
-    ident_t dst = bind_img(sh, "quality", out);
-    // clang-format off
-#pragma GLSL /* motion_quality_pass */                                          \
-    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
-    ivec2 b = ivec2(gl_GlobalInvocationID.xy);                                  \
-    if (all(lessThan(b, ivec2(${const int: gw}, ${const int: gh})))) {          \
-        float acc = 0.0, num = 0.0;                                             \
-        for (int d = 0; d < 2; d++)                                             \
-        for (int y = 0; y < ${const int: qb}; y++)                              \
-        for (int x = 0; x < ${const int: qb}; x++) {                            \
-            ivec2 p = b * ${const int: qb} + ivec2(x, y);                       \
-            if (any(greaterThanEqual(p, size)))                                 \
-                continue;                                                       \
-            acc += d == 0 ? texelFetch($fwd, p, 0).w : texelFetch($bwd, p, 0).w;\
-            num += 1.0;                                                         \
-        }                                                                       \
-        imageStore($dst, b, vec4(acc / max(num, 1.0), 0.0, 0.0, 0.0));         \
-    }
-    // clang-format on
-    return pl_dispatch_compute(dp, pl_dispatch_compute_params(
-        .shader = &sh, .dispatch_size = { PL_DIV_UP(gw, 8), PL_DIV_UP(gh, 8), 1 }));
+        .dispatch_size = { PL_DIV_UP(w, qb), PL_DIV_UP(h, qb), 1 }));
 }
 
 // Two contiguous histograms describing the global motion in the frame.
@@ -2304,8 +2289,8 @@ static bool motion_b_post(pl_gpu gpu, pl_dispatch dispatch,
     const unsigned stamp = ++obj->gather.pair;
     if (!motion_layer_pass(dispatch, dense, obj->gather.mark, stamp))
         return false;
-    return motion_pack_pass(dispatch, dense, obj->gather.mark, stamp, obj->gather.packed) &&
-           motion_quality_pass(dispatch, obj->gather.packed, obj->gather.quality);
+    return motion_pack_pass(dispatch, dense, obj->gather.mark, stamp,
+                            obj->gather.packed, obj->gather.quality);
 }
 bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
                         const struct pl_motion_estimate_params *params)
@@ -3166,7 +3151,7 @@ static bool frame_interp_gather(pl_shader sh,
     const int qw = qual->params.w, qh = qual->params.h;
     ident_t fwd = bind_tex(sh, "g_fwd", packed[0]);
     ident_t bwd = bind_tex(sh, "g_bwd", packed[1]);
-    ident_t qmap = bind_tex(sh, "g_qual", qual);
+    ident_t qmap = bind_tex_linear(sh, "g_qual", qual);
     const float isv = 1.0f / PL_SQUARE(MOTION_GATHER_VETO);
     // clang-format off
 #pragma GLSLH /* frame_interp_gather */                                         \
@@ -3190,21 +3175,10 @@ static bool frame_interp_gather(pl_shader sh,
     vec2 isz = 1.0 / fsz;                                                       \
     vec2 P = pa * fsz;                                                          \
     vec2 c0 = P - 0.5;                                                          \
-    float gate = 1.0;                                                           \
-    {                                                                           \
-        vec2 qg = P / ${const float: MOTION_QUALITY_BLOCK} - 0.5;               \
-        ivec2 q0 = ivec2(floor(qg));                                            \
-        vec2 qf = qg - vec2(q0);                                                \
-        ivec2 qs = ivec2(${const int: qw}, ${const int: qh}) - 1;               \
-        float qv = 0.0;                                                         \
-        for (int j = 0; j < 4; j++) {                                           \
-            ivec2 o = ivec2(j & 1, j >> 1);                                     \
-            vec2 bw = mix(1.0 - qf, qf, vec2(o));                               \
-            qv += bw.x * bw.y * texelFetch($qmap, clamp(q0 + o, ivec2(0), qs), 0).x;\
-        }                                                                       \
-        gate = 1.0 - smoothstep(${const float: MOTION_GATHER_QLO},              \
-                                ${const float: MOTION_GATHER_QHI}, qv);         \
-    }                                                                           \
+    float gate = 1.0 - smoothstep(${const float: MOTION_GATHER_QLO},            \
+        ${const float: MOTION_GATHER_QHI},                                      \
+        textureLod($qmap, P / ${const float: MOTION_QUALITY_BLOCK}              \
+                        / vec2(${const int: qw}, ${const int: qh}), 0.0).x);    \
     vec2 grid = P / ${const float: MOTION_GATHER_PITCH} - 0.5;                  \
     vec2 base = floor(grid), frac = grid - base;                                \
     vec4 ck[8]; vec2 vk[8], sk[8]; float wk[8], ek[8];                          \
