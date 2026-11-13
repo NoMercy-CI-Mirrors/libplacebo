@@ -70,7 +70,7 @@ struct sh_motion_obj {
 
     // EXPERIMENT (stage B): the selected vectors, and those with the occlusion
     // estimate, of each direction; `b_mode` is whether B ran
-    pl_tex b_sel[2], b_occ[2], b_shp[2];
+    pl_tex b_sel[2], b_occ[2], b_shp[2], b_sub[2];
     int b_mode;
 
     // State of the splat, see `splat_prepare`: the vector and key prefix of
@@ -78,7 +78,7 @@ struct sh_motion_obj {
     // of this and the next intermediate frame by turns (`frame` counts them),
     // and the pixels in front of others, as those holding `pair`
     struct {
-        pl_buf src, key[2], mark;
+        pl_buf src, key[2], mark, acc, qual;
         unsigned pair, frame;
         bool dirty;
     } splat;
@@ -669,6 +669,7 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
     pl_tex_destroy(gpu, &obj->flow.dense_bwd);
     for (int i = 0; i < 2; i++) {
         pl_tex_destroy(gpu, &obj->b_sel[i]);
+        pl_tex_destroy(gpu, &obj->b_sub[i]);
         pl_tex_destroy(gpu, &obj->b_occ[i]);
         pl_tex_destroy(gpu, &obj->b_shp[i]);
     }
@@ -676,6 +677,8 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
     pl_buf_destroy(gpu, &obj->splat.key[0]);
     pl_buf_destroy(gpu, &obj->splat.key[1]);
     pl_buf_destroy(gpu, &obj->splat.mark);
+    pl_buf_destroy(gpu, &obj->splat.acc);
+    pl_buf_destroy(gpu, &obj->splat.qual);
     pl_tex_destroy(gpu, &obj->raw_dbg[0]);
     pl_tex_destroy(gpu, &obj->raw_dbg[1]);
     for (int i = 0; i < 4; i++) {
@@ -2000,6 +2003,115 @@ error:
 // motion boundary along with the side of higher contrast. Where a pixel's
 // neighbours move differently, let it take a neighbour's vector if the pixel
 // itself matches clearly better that way.
+// EXPERIMENT (two step B): per S x S sub-block, the best of the candidates of
+// `motion_select_pass` (block vectors of `blocks` around it, far rings, zero,
+// previous field) by the SSD over the sub-block and a border. Writes one
+// vector per sub-block into `out`.
+static bool motion_subsel_pass(pl_gpu gpu, pl_dispatch dispatch, int bs, int S,
+                               pl_tex ref, pl_tex tgt, pl_tex blocks, pl_tex out,
+                               pl_tex prev_field)
+{
+    const int w = ref->params.w, h = ref->params.h;
+    const int gw = out->params.w, gh = out->params.h;
+    const int far = dc_env("LM_B2_FAR", 4);
+    const bool zero = dc_env("LM_B2_ZERO", 1);
+    const float margin = b_envf("LM_B2_MARGIN", 1.0f) / 255.0f;
+    const int nring = dc_env("LM_B2_DIAG", 1) ? 8 : 4;
+    const bool temp = prev_field && dc_env("LM_B2_TEMP", 1);
+    const int border = dc_env("LM_B2_BORDER", 1);
+    const int ncand = 9 + nring * far + (zero ? 1 : 0) + (temp ? 1 : 0);
+    const float dup = PL_SQUARE(b_envf("LM_B2_DUP", 0.1f));
+    const int W = S + 2 * border;
+
+    pl_shader sh = pl_dispatch_begin(dispatch);
+    sh_describef(sh, "motion sub-block selection (%dx%d, %dx%d)", gw, gh, S, S);
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 8, 8, false, 0)) {
+        pl_dispatch_abort(dispatch, &sh);
+        return false;
+    }
+    ident_t blk = bind_tex(sh, "blocks", blocks);
+    ident_t ref_id = bind_tex(sh, "ref", ref);
+    ident_t tgt_id = bind_tex_linear(sh, "tgt", tgt);
+    ident_t dst = bind_img(sh, "sub_out", out);
+    ident_t prev_id = temp ? bind_tex(sh, "prev_field", prev_field) : NULL_IDENT;
+#pragma GLSL /* motion_subsel_pass */                                           \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 grid = ivec2(${const int: blocks->params.w}, ${const int: blocks->params.h});\
+    ivec2 sb   = ivec2(gl_GlobalInvocationID.xy);                               \
+    if (all(lessThan(sb, ivec2(${const int: gw}, ${const int: gh})))) {         \
+        ivec2 org = sb * ${const int: S};                                       \
+        ivec2 cen = min(org + ${const int: S} / 2, size - 1);                   \
+        vec2 pt = 1.0 / vec2(size);                                             \
+        const ivec2 near[9] = ivec2[9](ivec2(0, 0),                             \
+            ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0),            \
+            ivec2(1, 0), ivec2(-1, 1), ivec2(0, 1), ivec2(1, 1));               \
+        vec2 best = vec2(0.0), own = vec2(0.0), last = vec2(0.0);               \
+        float best_cost = 1e9;                                                  \
+        for (int k = 0; k < ${const int: ncand}; k++) {                         \
+            vec2 v = vec2(0.0);                                                 \
+            if (k < ${const int: 9 + nring * far}) {                            \
+                ivec2 o = near[k < 9 ? k : 0];                                  \
+                if (k >= 9) {                                                   \
+                    int j = (k - 9) % ${const int: nring};                      \
+                    @if (nring == 4)                                            \
+                        j = j == 0 ? 2 : j == 1 ? 4 : j == 2 ? 5 : 7;           \
+                    @else                                                       \
+                        j += 1;                                                 \
+                    o = near[j] * (2 << ((k - 9) / ${const int: nring}));       \
+                }                                                               \
+                ivec2 b = clamp(cen / ${const int: bs} + o, ivec2(0), grid - 1);\
+                v = texelFetch($blk, b, 0).xy;                                  \
+            }                                                                   \
+            @if (temp) {                                                        \
+            if (k == ${const int: ncand - 1})                                   \
+                v = texelFetch($prev_id, cen, 0).xy;                            \
+            @}                                                                  \
+            vec2 d0 = v - own, d1 = v - last, d2 = v - best;                    \
+            if (k > 0 && (dot(d0, d0) < ${const float: dup} || dot(d1, d1) < ${const float: dup} || dot(d2, d2) < ${const float: dup}))\
+                continue;                                                       \
+            if (k == 0)                                                         \
+                own = v;                                                        \
+            last = v;                                                           \
+            float cost = 0.0;                                                   \
+            for (int i = 0; i < ${const int: W * W}; i++) {                     \
+                ivec2 q = clamp(org + ivec2(i % ${const int: W}, i / ${const int: W}) - ${const int: border}, ivec2(0), size - 1);\
+                float d = texelFetch($ref_id, q, 0).r - textureLod($tgt_id, (vec2(q) + 0.5 + v) * pt, 0.0).r;\
+                cost += d * d * 255.0;                                          \
+            }                                                                   \
+            cost = cost / float(${const int: W * W}) + (k == 0 ? 0.0 : ${const float: margin});\
+            if (cost < best_cost) {                                             \
+                best_cost = cost;                                               \
+                best = v;                                                       \
+            }                                                                   \
+        }                                                                       \
+        imageStore($dst, sb, vec4(best, 1.0, 0.0));                             \
+    }
+    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+        .shader = &sh, .dispatch_size = { PL_DIV_UP(gw, 8), PL_DIV_UP(gh, 8), 1 }));
+}
+
+// EXPERIMENT: nearest upsampling of a sub-block field to full resolution
+static bool motion_upsample_pass(pl_gpu gpu, pl_dispatch dispatch, int S,
+                                 pl_tex sub, pl_tex out)
+{
+    pl_shader sh = pl_dispatch_begin(dispatch);
+    sh_describe(sh, "motion sub-block upsampling");
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 16, 16, false, 0)) {
+        pl_dispatch_abort(dispatch, &sh);
+        return false;
+    }
+    ident_t src = bind_tex(sh, "sub", sub);
+    ident_t dst = bind_img(sh, "up_out", out);
+#pragma GLSL /* upsample */                                                     \
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);                                \
+    if (all(lessThan(pos, ivec2(${const int: out->params.w}, ${const int: out->params.h}))))\
+        imageStore($dst, pos, vec4(texelFetch($src, pos / ${const int: S}, 0).xy, 1.0, 0.0));
+    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+        .shader = &sh, .dispatch_size = { PL_DIV_UP(out->params.w, 16), PL_DIV_UP(out->params.h, 16), 1 }));
+}
+
 static bool motion_sharpen_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex ref,
                                 pl_tex tgt, pl_tex flow, pl_tex out)
 {
@@ -2375,6 +2487,9 @@ static bool splat_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
     sh = pl_dispatch_begin(dp);
     const int xconf = dc_env("X_CONF", 1);
     const float expl_d = b_envf("X_EXPLD", 0.5f), expl_t = b_envf("X_EXPLT", 0.5f);
+    const float rel_t = b_envf("X_RT", 1.0f), rel_n = b_envf("X_RN", 6.0f);
+    const float rel_c = b_envf("X_RC", 32.0f), rel_h = b_envf("X_RH", 0.5f);
+    const int rel_off = dc_env("X_ROFF", 0);
     sh_describe(sh, "splat source packing");
     sh->output = PL_SHADER_SIG_NONE;
     if (!sh_try_compute(sh, 16, 16, false, 0)) {
@@ -2432,6 +2547,18 @@ static bool splat_prepare(struct sh_motion_obj *obj, pl_gpu gpu, pl_dispatch dp)
         uint prefix = (3u - layer) << 30 | cost << 21;                          \
         if (hidden)                                                             \
             prefix |= ${const uint: SPLAT_HIDDEN};                              \
+        /* EXPERIMENT: reliability of the vector, bits 0-7 */                   \
+        float coh = 0.0;                                                        \
+        for (int j = 0; j < 9; j++) {                                           \
+            ivec2 np = clamp(pos + ivec2(j % 3, j / 3) - 1, ivec2(0), size - 1);\
+            vec2 nv = d == 0 ? texelFetch($fwd, np, 0).xy : texelFetch($bwd, np, 0).xy;\
+            coh += length(nv - f.xy) < ${float: rel_t} ? 1.0 : 0.0;             \
+        }                                                                       \
+        coh = clamp((coh - 1.0) / ${float: rel_n}, 0.0, 1.0);                   \
+        float rel = coh * exp(-float(cost) / ${float: rel_c})                    \
+                  * (hidden ? ${float: rel_h} : 1.0);                           \
+        if (${const int: rel_off} != 0) rel = 1.0;                              \
+        prefix |= uint(clamp(rel, 0.0, 1.0) * 255.0 + 0.5);                     \
         splat_src[idx] = uvec2(packHalf2x16(f.xy), prefix);                     \
     }
     // clang-format on
@@ -2484,7 +2611,7 @@ static bool splat_scatter(struct sh_motion_obj *obj, pl_dispatch dp, float t)
         if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size)) ||     \
             any(greaterThan(abs(off), ivec2(511))))                             \
             continue;                                                           \
-        uint key = src.y | uint(d) << 20 | uint(off.y + 512) << 10              \
+        uint key = (src.y & 0xFFE00000u) | uint(d) << 20 | uint(off.y + 512) << 10\
                  | uint(off.x + 512);                                           \
         atomicMin(splat_key[q.y * size.x + q.x], key);                          \
     }
@@ -3002,7 +3129,21 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
                                     obj->fine[d][s], true, dbg);
             prev = obj->fine[d][s];
         }
-        if (bmode && dc_env("LM_B_SEL", 1)) {
+        const int two = bmode ? dc_env("LM_B_TWO", 0) : 0;
+        if (two) {
+            const int pbs = params->block_size >> PL_MIN(nfine, 3);
+            pl_tex ra = fwd ? obj->pyramid_prev.elem[0] : obj->scratch.levels.elem[0];
+            pl_tex rb = fwd ? obj->scratch.levels.elem[0] : obj->pyramid_prev.elem[0];
+            ok = ok && dense_flow_recreate(gpu, &obj->b_sub[d], PL_DIV_UP(ra->params.w, two),
+                                           PL_DIV_UP(ra->params.h, two), prev->params.format) &&
+                 motion_subsel_pass(gpu, input->dispatch, pbs, two, ra, rb, prev, obj->b_sub[d],
+                                    has_prior && dc_env("LM_B2_TEMP", 1) ?
+                                    (fwd ? obj->flow.dense_fwd : obj->flow.dense_bwd) : NULL) &&
+                 (dc_env("LM_B2_NOREF", 0)
+                  ? motion_upsample_pass(gpu, input->dispatch, two, obj->b_sub[d], obj->b_sel[d])
+                  : motion_refine_pass(gpu, input->dispatch, two, ra, rb, obj->b_sub[d],
+                                       obj->b_sel[d], true));
+        } else if (bmode && dc_env("LM_B_SEL", 1)) {
             ok = ok && motion_select_pass(gpu, input->dispatch,
                                 params->block_size >> PL_MIN(nfine, 3),
                                 fwd ? obj->pyramid_prev.elem[0]
@@ -3537,6 +3678,529 @@ static bool frame_interp_local(pl_shader sh,
 
 // Samples each frame once per pixel, at the position the splat's winner at
 // this pixel was displaced from, and mixes the two samples.
+// EXPERIMENT (2026-11-13): gather and soft splat variants on stage B's fields
+// and the splat's layer marks, see /z/ai/claude/2026-11-13-softsplat.
+//
+// X_GATHER=1: lattice style gather (as frame_interp_local). Each side of a
+// candidate counts as far as the pixel it samples moves with the candidate
+// (X_GSV px tolerance, X_GVF floor), and candidates landing on front marked
+// pixels get exp(X_GBETA).
+// X_SOFT=1: confidence weighted soft splat of every source pixel's colour
+// (bilinear footprint, fixed point atomics), holes from the gather.
+
+// Soft splat of both frames to `t` into `splat.acc` (r, g, b, w per pixel).
+static bool soft_scatter(struct sh_motion_obj *obj, pl_dispatch dp,
+                         const struct pl_frame_interp_input *input, float t)
+{
+    pl_gpu gpu = input->gpu;
+    const int w = obj->flow.dense_fwd->params.w, h = obj->flow.dense_fwd->params.h;
+    const size_t n = (size_t) w * h;
+    struct pl_buffer_var acc_var = uint_array_var("soft_acc", 4, n);
+    struct pl_buffer_var src_var = uint_array_var("splat_src", 2, 2 * n);
+    if (!pl_buf_recreate(gpu, &obj->splat.acc, pl_buf_params(
+            .size = acc_var.layout.size, .storable = true)))
+        return false;
+
+    pl_shader sh = pl_dispatch_begin(dp);
+    sh_describe(sh, "soft splat clear");
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 16, 16, false, 0)) {
+        pl_dispatch_abort(dp, &sh);
+        return false;
+    }
+    bind_buf(sh, "soft_acc_buf", obj->splat.acc, PL_DESC_ACCESS_WRITEONLY, &acc_var, 1);
+#pragma GLSL /* soft clear */                                                   \
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);                                \
+    if (all(lessThan(pos, ivec2(${const int: w}, ${const int: h}))))            \
+        soft_acc[pos.y * ${const int: w} + pos.x] = uvec4(0u);
+    if (!pl_dispatch_compute(dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(h, 16), 1 })))
+        return false;
+
+    const float beta = b_envf("X_SBETA", 3.0f), scost = b_envf("X_SCOST", 16.0f);
+    const float shid = b_envf("X_SHID", 0.1f);
+    const int two = dc_env("X_STWO", 1), foot = dc_env("X_SFOOT", 1);
+    sh = pl_dispatch_begin(dp);
+    sh_describe(sh, "soft splat");
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 16, 16, false, 0)) {
+        pl_dispatch_abort(dp, &sh);
+        return false;
+    }
+    ident_t fa = bind_tex_linear(sh, "soft_a", input->a.tex);
+    ident_t fb = bind_tex_linear(sh, "soft_b", input->b.tex);
+    bind_buf(sh, "splat_src_buf", obj->splat.src, PL_DESC_ACCESS_READONLY, &src_var, 1);
+    bind_buf(sh, "soft_acc_buf", obj->splat.acc, PL_DESC_ACCESS_READWRITE, &acc_var, 1);
+#pragma GLSLH /* soft splat */                                                  \
+    void soft_add(ivec2 q, vec3 c, float wt) {                                  \
+        ivec2 size = ivec2(${const int: w}, ${const int: h});                   \
+        if (wt <= 0.0 || any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size)))\
+            return;                                                             \
+        uint wq = uint(wt * 256.0 + 0.5);                                       \
+        if (wq == 0u)                                                           \
+            return;                                                             \
+        int i = q.y * size.x + q.x;                                             \
+        uvec3 cq = uvec3(clamp(c, 0.0, 1.0) * 1023.0 + 0.5) * wq;               \
+        atomicAdd(soft_acc[i].x, cq.x);                                         \
+        atomicAdd(soft_acc[i].y, cq.y);                                         \
+        atomicAdd(soft_acc[i].z, cq.z);                                         \
+        atomicAdd(soft_acc[i].w, wq);                                           \
+    }
+#pragma GLSL /* soft splat */                                                   \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 pos  = ivec2(gl_GlobalInvocationID.xy);                               \
+    float t    = ${float: t};                                                   \
+    vec2 isz   = 1.0 / vec2(size);                                              \
+    for (int d = 0; d < 2; d++) {                                               \
+        if (any(greaterThanEqual(pos, size)))                                   \
+            break;                                                              \
+        uvec2 src = splat_src[d * size.x * size.y + pos.y * size.x + pos.x];    \
+        vec2 f = unpackHalf2x16(src.x);                                         \
+        float layer = (src.y >> 30) == 2u ? 1.0 : 0.0;                          \
+        bool hid = (src.y & ${const uint: SPLAT_HIDDEN}) != 0u;                 \
+        float cost = float(src.y >> 21 & 255u);                                 \
+        float tt = d == 0 ? t : 1.0 - t;                                        \
+        float wt = (1.0 - tt) * exp(${float: beta} * layer)                     \
+                 * (hid ? ${float: shid} : exp(-cost / ${float: scost}));       \
+        vec2 sp = (vec2(pos) + 0.5) * isz;                                      \
+        vec2 op = (vec2(pos) + 0.5 + f) * isz;                                  \
+        vec3 c = d == 0 ? textureLod($fa, sp, 0.0).rgb : textureLod($fb, sp, 0.0).rgb;\
+        if (${const int: two} != 0 && !hid) {                                   \
+            vec3 o = d == 0 ? textureLod($fb, op, 0.0).rgb : textureLod($fa, op, 0.0).rgb;\
+            c = mix(c, o, tt);                                                  \
+        }                                                                       \
+        vec2 x = vec2(pos) + tt * f;                                            \
+        if (${const int: foot} == 1) {                                          \
+            ivec2 x0 = ivec2(floor(x));                                         \
+            vec2 fr = x - vec2(x0);                                             \
+            soft_add(x0,               c, wt * (1.0 - fr.x) * (1.0 - fr.y));    \
+            soft_add(x0 + ivec2(1, 0), c, wt * fr.x * (1.0 - fr.y));            \
+            soft_add(x0 + ivec2(0, 1), c, wt * (1.0 - fr.x) * fr.y);            \
+            soft_add(x0 + ivec2(1, 1), c, wt * fr.x * fr.y);                    \
+        } else {                                                                \
+            soft_add(ivec2(floor(x + 0.5)), c, wt);                             \
+        }                                                                       \
+    }
+    return pl_dispatch_compute(dp, pl_dispatch_compute_params(
+        .shader = &sh, .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(h, 16), 1 }));
+}
+
+// EXPERIMENT: mean mismatch cost of both fields per QB x QB block (smooth gate
+// for the gather's veto)
+static bool gather_quality(struct sh_motion_obj *obj, pl_dispatch dp, pl_gpu gpu, int qb)
+{
+    const int w = obj->flow.dense_fwd->params.w, h = obj->flow.dense_fwd->params.h;
+    const int gw = PL_DIV_UP(w, qb), gh = PL_DIV_UP(h, qb);
+    struct pl_buffer_var q_var = uint_array_var("g_qual", 1, (size_t) gw * gh);
+    struct pl_buffer_var src_var = uint_array_var("splat_src", 2, 2 * (size_t) w * h);
+    if (!pl_buf_recreate(gpu, &obj->splat.qual, pl_buf_params(
+            .size = q_var.layout.size, .storable = true)))
+        return false;
+    pl_shader sh = pl_dispatch_begin(dp);
+    sh_describe(sh, "gather field quality");
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 8, 8, false, 0)) {
+        pl_dispatch_abort(dp, &sh);
+        return false;
+    }
+    bind_buf(sh, "splat_src_buf", obj->splat.src, PL_DESC_ACCESS_READONLY, &src_var, 1);
+    bind_buf(sh, "g_qual_buf", obj->splat.qual, PL_DESC_ACCESS_WRITEONLY, &q_var, 1);
+    const float hcost = b_envf("X_QH", 64.0f);
+#pragma GLSL /* gather quality */                                               \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy);                                  \
+    if (all(lessThan(b, ivec2(${const int: gw}, ${const int: gh})))) {          \
+        float acc = 0.0, num = 0.0;                                             \
+        for (int d = 0; d < 2; d++)                                             \
+        for (int y = 0; y < ${const int: qb}; y++)                              \
+        for (int x = 0; x < ${const int: qb}; x++) {                            \
+            ivec2 p = b * ${const int: qb} + ivec2(x, y);                       \
+            if (any(greaterThanEqual(p, size)))                                 \
+                continue;                                                       \
+            uint pre = splat_src[d * size.x * size.y + p.y * size.x + p.x].y;   \
+            bool hid = (pre & ${const uint: SPLAT_HIDDEN}) != 0u;               \
+            acc += hid ? ${float: hcost} : float(pre >> 21 & 255u);             \
+            num += 1.0;                                                         \
+        }                                                                       \
+        g_qual[b.y * ${const int: gw} + b.x] = floatBitsToUint(acc / max(num, 1.0));\
+    }
+    return pl_dispatch_compute(dp, pl_dispatch_compute_params(
+        .shader = &sh, .dispatch_size = { PL_DIV_UP(gw, 8), PL_DIV_UP(gh, 8), 1 }));
+}
+
+// EXPERIMENT: patch splat. Every S x S patch of each frame moves rigidly with
+// the vector at its centre; each covered output pixel is a fragment that
+// samples both frames along that vector, as far as the pixels it samples
+// move with the patch (X_PSV px). Fragments add up, weighted, in `splat.acc`.
+static bool patch_scatter(struct sh_motion_obj *obj, pl_dispatch dp,
+                          const struct pl_frame_interp_input *input, float t, int S)
+{
+    pl_gpu gpu = input->gpu;
+    const int w = obj->flow.dense_fwd->params.w, h = obj->flow.dense_fwd->params.h;
+    const size_t n = (size_t) w * h;
+    struct pl_buffer_var acc_var = uint_array_var("soft_acc", 4, n);
+    struct pl_buffer_var src_var = uint_array_var("splat_src", 2, 2 * n);
+    if (!pl_buf_recreate(gpu, &obj->splat.acc, pl_buf_params(
+            .size = acc_var.layout.size, .storable = true)))
+        return false;
+    pl_shader sh = pl_dispatch_begin(dp);
+    sh_describe(sh, "soft splat clear");
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 16, 16, false, 0)) {
+        pl_dispatch_abort(dp, &sh);
+        return false;
+    }
+    bind_buf(sh, "soft_acc_buf", obj->splat.acc, PL_DESC_ACCESS_WRITEONLY, &acc_var, 1);
+#pragma GLSL /* soft clear */                                                   \
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);                                \
+    if (all(lessThan(pos, ivec2(${const int: w}, ${const int: h}))))            \
+        soft_acc[pos.y * ${const int: w} + pos.x] = uvec4(0u);
+    if (!pl_dispatch_compute(dp, pl_dispatch_compute_params(
+            .shader = &sh, .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(h, 16), 1 })))
+        return false;
+
+    const int gw = PL_DIV_UP(w, S), gh = PL_DIV_UP(h, S);
+    const float sv = b_envf("X_PSV", 1.5f), beta = b_envf("X_PBETA", 3.0f);
+    const float sigma = b_envf("X_PSIG", 0.2f);
+    sh = pl_dispatch_begin(dp);
+    sh_describe(sh, "patch splat");
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 16, 16, false, 0)) {
+        pl_dispatch_abort(dp, &sh);
+        return false;
+    }
+    ident_t fa = bind_tex_linear(sh, "pt_a", input->a.tex);
+    ident_t fb = bind_tex_linear(sh, "pt_b", input->b.tex);
+    ident_t fwd = bind_tex(sh, "pt_fwd", obj->flow.dense_fwd);
+    ident_t bwd = bind_tex(sh, "pt_bwd", obj->flow.dense_bwd);
+    bind_buf(sh, "splat_src_buf", obj->splat.src, PL_DESC_ACCESS_READONLY, &src_var, 1);
+    bind_buf(sh, "soft_acc_buf", obj->splat.acc, PL_DESC_ACCESS_READWRITE, &acc_var, 1);
+#pragma GLSLH /* patch splat */                                                 \
+    void soft_add(ivec2 q, vec3 c, float wt) {                                  \
+        ivec2 size = ivec2(${const int: w}, ${const int: h});                   \
+        if (wt <= 0.0 || any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size)))\
+            return;                                                             \
+        uint wq = uint(wt * 256.0 + 0.5);                                       \
+        if (wq == 0u)                                                           \
+            return;                                                             \
+        int i = q.y * size.x + q.x;                                             \
+        uvec3 cq = uvec3(clamp(c, 0.0, 1.0) * 1023.0 + 0.5) * wq;               \
+        atomicAdd(soft_acc[i].x, cq.x);                                         \
+        atomicAdd(soft_acc[i].y, cq.y);                                         \
+        atomicAdd(soft_acc[i].z, cq.z);                                         \
+        atomicAdd(soft_acc[i].w, wq);                                           \
+    }
+#pragma GLSL /* patch splat */                                                  \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    ivec2 gid  = ivec2(gl_GlobalInvocationID.xy);                               \
+    const int S = ${const int: S};                                              \
+    ivec2 blk  = gid / (S + 1), o = gid % (S + 1);                              \
+    float t    = ${float: t};                                                   \
+    vec2 isz   = 1.0 / vec2(size);                                              \
+    float isv  = 1.0 / (${float: sv} * ${float: sv});                           \
+    for (int d = 0; d < 2; d++) {                                               \
+        if (any(greaterThanEqual(blk, ivec2(${const int: gw}, ${const int: gh}))))\
+            break;                                                              \
+        ivec2 org = blk * S;                                                    \
+        ivec2 cen = min(org + S / 2, size - 1);                                 \
+        vec2 f = d == 0 ? texelFetch($fwd, cen, 0).xy : texelFetch($bwd, cen, 0).xy;\
+        vec2 u = d == 0 ? f : -f;                                               \
+        float tt = d == 0 ? t : -(1.0 - t);                                     \
+        ivec2 y = ivec2(floor(vec2(org) + tt * u)) + o;                         \
+        vec2 sp = vec2(y) - tt * u;                                             \
+        if (any(lessThan(sp, vec2(org) - 0.5)) || any(greaterThanEqual(sp, vec2(org + S) - 0.5)))\
+            continue;                                                           \
+        vec2 c0 = vec2(y);                                                      \
+        vec2 qa = c0 - t * u, qb = c0 + (1.0 - t) * u;                          \
+        ivec2 ia = clamp(ivec2(floor(qa + 0.5)), ivec2(0), size - 1);           \
+        ivec2 ib = clamp(ivec2(floor(qb + 0.5)), ivec2(0), size - 1);           \
+        vec2 da = texelFetch($fwd, ia, 0).xy - u;                               \
+        vec2 db = texelFetch($bwd, ib, 0).xy + u;                               \
+        float ma = exp(-dot(da, da) * isv), mb = exp(-dot(db, db) * isv);       \
+        float own = d == 0 ? ma : mb;                                           \
+        float va = d == 0 ? 1.0 : ma, vb = d == 0 ? mb : 1.0;                   \
+        vec3 ca = textureLod($fa, (qa + 0.5) * isz, 0.0).rgb;                   \
+        vec3 cb = textureLod($fb, (qb + 0.5) * isz, 0.0).rgb;                   \
+        float wa = (1.0 - t) * va, wb = t * vb;                                 \
+        vec3 c = (wa * ca + wb * cb) / max(wa + wb, 1e-6);                      \
+        float la = sqrt(max(dot(ca, vec3(0.2126, 0.7152, 0.0722)), 0.0));       \
+        float lb = sqrt(max(dot(cb, vec3(0.2126, 0.7152, 0.0722)), 0.0));       \
+        float err = abs(la - lb) * min(va, vb) / ${float: sigma};               \
+        ivec2 is = d == 0 ? ia : ib;                                            \
+        uint pre = splat_src[d * size.x * size.y + is.y * size.x + is.x].y;     \
+        float fr = (pre >> 30) == 2u ? 1.0 : 0.0;                               \
+        float wt = (d == 0 ? 1.0 - t : t) * own * exp(-err * err)               \
+                 * exp(${float: beta} * fr);                                    \
+        soft_add(y, c, wt);                                                     \
+    }
+    return pl_dispatch_compute(dp, pl_dispatch_compute_params(
+        .shader = &sh, .dispatch_size = { PL_DIV_UP(gw * (S + 1), 16), PL_DIV_UP(gh * (S + 1), 16), 1 }));
+}
+
+static bool frame_interp_gather(pl_shader sh, struct sh_motion_obj *obj,
+                                const struct pl_frame_interp_input *input,
+                                const struct pl_color_space *out_color, float t)
+{
+    const int patch = dc_env("X_PATCH", 0);
+    const bool soft = dc_env("X_SOFT", 0) || patch;
+    if (patch ? !patch_scatter(obj, input->dispatch, input, t, patch)
+              : soft && !soft_scatter(obj, input->dispatch, input, t))
+        return false;
+    const int qb = dc_env("X_QB", 0);
+    if (qb && !gather_quality(obj, input->dispatch, input->gpu, qb))
+        return false;
+    const struct pl_tex_params *tpars = &input->a.tex->params;
+    const struct pl_motion_estimate_frame *frames[2] = { &input->a, &input->b };
+    ident_t conv[2];
+    for (int i = 0; i < 2; i++) {
+        pl_shader sub = pl_dispatch_begin_ex(input->dispatch, true);
+        if (sub->prefix == sh->prefix) {
+            pl_dispatch_abort(input->dispatch, &sub);
+            sub = pl_dispatch_begin_ex(input->dispatch, true);
+        }
+        sh_require(sub, PL_SHADER_SIG_COLOR, 0, 0);
+        struct pl_color_repr repr = frames[i]->repr;
+        struct pl_color_space csp = frames[i]->color;
+        pl_color_space_infer(&csp);
+        if (!pl_color_space_equal(&csp, out_color)) {
+            pl_shader_set_alpha(sub, &repr, PL_ALPHA_INDEPENDENT);
+            pl_shader_color_map_ex(sub, NULL, pl_color_map_args(csp, *out_color));
+        }
+        pl_shader_set_alpha(sub, &repr, PL_ALPHA_PREMULTIPLIED);
+        conv[i] = sh_subpass(sh, sub);
+        pl_dispatch_abort(input->dispatch, &sub);
+        if (!conv[i])
+            return false;
+    }
+    if (!sh_require(sh, PL_SHADER_SIG_NONE, tpars->w, tpars->h))
+        return false;
+    sh_describe(sh, "frame interpolation (gather)");
+    ident_t tex[2], pos[2], pt[2], cubic[2];
+    for (int i = 0; i < 2; i++) {
+        tex[i] = sh_bind(sh, frames[i]->tex, PL_TEX_ADDRESS_CLAMP, PL_TEX_SAMPLE_LINEAR,
+                         "frame", NULL, &pos[i], &pt[i]);
+        if (!tex[i])
+            return false;
+        cubic[i] = sh_fresh(sh, "cubic");
+#pragma GLSLH /* frame_interp_gather */                                         \
+    vec4 ${cubic[i]}(vec2 p) {                                                  \
+        vec2 pt = ${pt[i]};                                                     \
+        vec2 c  = floor(p / pt - 0.5) + 0.5;                                    \
+        vec2 f  = p / pt - c;                                                   \
+        vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));                             \
+        vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);                               \
+        vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));                              \
+        vec2 w3 = f * f * (-0.5 + 0.5 * f);                                     \
+        vec2 w12 = w1 + w2;                                                     \
+        vec2 p0  = (c - 1.0) * pt;                                              \
+        vec2 p12 = (c + w2 / w12) * pt;                                         \
+        vec2 p3  = (c + 2.0) * pt;                                              \
+        float wsum = w12.x * w0.y + (w0.x + w12.x + w3.x) * w12.y + w12.x * w3.y;\
+        return ${conv[i]}(                                                      \
+            (textureLod(${tex[i]}, vec2(p12.x, p0.y),  0.0) * w12.x * w0.y +    \
+            (textureLod(${tex[i]}, vec2(p0.x,  p12.y), 0.0) * w0.x  +           \
+             textureLod(${tex[i]}, vec2(p12.x, p12.y), 0.0) * w12.x +           \
+             textureLod(${tex[i]}, vec2(p3.x,  p12.y), 0.0) * w3.x) * w12.y +   \
+             textureLod(${tex[i]}, vec2(p12.x, p3.y),  0.0) * w12.x * w3.y) / wsum);\
+    }
+    }
+
+    pl_tex fields[2] = { obj->flow.dense_fwd, obj->flow.dense_bwd };
+    const int w = fields[0]->params.w, h = fields[0]->params.h;
+    const size_t n = (size_t) w * h;
+    struct pl_buffer_var src_var = uint_array_var("splat_src", 2, 2 * n);
+    bind_buf(sh, "splat_src_buf", obj->splat.src, PL_DESC_ACCESS_READONLY, &src_var, 1);
+    if (soft) {
+        struct pl_buffer_var acc_var = uint_array_var("soft_acc", 4, n);
+        bind_buf(sh, "soft_acc_buf", obj->splat.acc, PL_DESC_ACCESS_READONLY, &acc_var, 1);
+    }
+    ident_t fwd = bind_tex(sh, "g_fwd", fields[0]);
+    ident_t bwd = bind_tex(sh, "g_bwd", fields[1]);
+    const int qgw = qb ? PL_DIV_UP(w, qb) : 1, qgh = qb ? PL_DIV_UP(h, qb) : 1;
+    if (qb) {
+        struct pl_buffer_var q_var = uint_array_var("g_qual", 1, (size_t) qgw * qgh);
+        bind_buf(sh, "g_qual_buf", obj->splat.qual, PL_DESC_ACCESS_READONLY, &q_var, 1);
+    }
+    const float qlo = b_envf("X_QLO", 8.0f), qhi = b_envf("X_QHI", 24.0f);
+    const float pitch = b_envf("X_GP", 4.0f);
+    const int iters = dc_env("X_GIT", 0);
+    const int val = dc_env("X_GVAL", 1);
+    const float sv = b_envf("X_GSV", 1.5f), vfl = b_envf("X_GVF", 0.1f);
+    const float beta = b_envf("X_GBETA", 3.0f);
+    const float sigma = b_envf("X_GSIG", 0.2f), sharp = b_envf("X_GSHARP", 1.0f);
+    const float fallback = b_envf("X_GFB", 0.05f);
+    const int useconf = dc_env("X_GCONF", 0);
+    const float softmin = b_envf("X_SMIN", 0.05f);
+    const bool surv = dc_env("X_SURV", 0);
+    const bool gv4 = dc_env("X_GV4", 0);
+    const float slo = b_envf("X_SLO", 0.3f), shi = b_envf("X_SHI", 0.7f);
+#pragma GLSLH /* frame_interp_gather */                                         \
+    vec4 g_sa(vec2 p) { return ${conv[0]}(textureLod(${tex[0]}, p, 0.0)); }     \
+    vec4 g_sb(vec2 p) { return ${conv[1]}(textureLod(${tex[1]}, p, 0.0)); }     \
+    float g_in(vec2 q, vec2 sz) {                                               \
+        return all(greaterThanEqual(q, vec2(-0.5))) &&                          \
+               all(lessThanEqual(q, sz - 0.5)) ? 1.0 : 0.0;                     \
+    }                                                                           \
+    float g_luma(vec4 c) {                                                      \
+        return sqrt(max(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0));        \
+    }                                                                           \
+    float g_front(int d, ivec2 q, ivec2 size) {                                 \
+        q = clamp(q, ivec2(0), size - 1);                                       \
+        uint pre = splat_src[d * size.x * size.y + q.y * size.x + q.x].y;       \
+        return (pre >> 30) == 2u ? 1.0 : 0.0;                                   \
+    }
+#pragma GLSLH /* frame_interp_gather */                                         \
+    /* weighted blend of candidates, with the lattice's photometric weighting  \
+     * and resampling along the mean where they agree */                       \
+    vec4 g_blend(vec4 ck[8], vec2 vk[8], vec2 sk[8], float wk[8], float ek[8],  \
+                 vec2 c0, float t, vec2 fsz, vec2 isz, out float sum) {         \
+        float emin = 1e9;                                                       \
+        for (int k = 0; k < 8; k++)                                             \
+            if (wk[k] > 0.0) emin = min(emin, ek[k]);                           \
+        sum = 0.0; vec4 mc = vec4(0.0); vec2 mv = vec2(0.0), ms = vec2(0.0);    \
+        for (int k = 0; k < 8; k++) {                                           \
+            float w = wk[k] * exp((emin * emin - ek[k] * ek[k]) / (${float: sigma} * ${float: sigma}));\
+            wk[k] = w;                                                          \
+            sum += w; mc += w * ck[k]; mv += w * vk[k]; ms += w * sk[k];        \
+        }                                                                       \
+        if (sum <= 1e-6)                                                        \
+            return vec4(0.0);                                                   \
+        mv /= sum; ms /= sum;                                                   \
+        if (${float: sharp} > 0.0) {                                            \
+            float var = 0.0;                                                    \
+            for (int k = 0; k < 8; k++) {                                       \
+                vec2 dv = vk[k] - mv;                                           \
+                var += wk[k] * dot(dv, dv);                                     \
+            }                                                                   \
+            float agree = exp(-var / sum / (${float: sharp} * ${float: sharp}));\
+            if (agree > 0.004) {                                                \
+                vec2 qa = c0 - t * mv, qb = c0 + (1.0 - t) * mv;                \
+                vec4 ca = ${cubic[0]}((qa + 0.5) * isz), cb = ${cubic[1]}((qb + 0.5) * isz);\
+                float wa = (1.0 - t) * g_in(qa, fsz) * ms.x, wb = t * g_in(qb, fsz) * ms.y;\
+                vec4 cp = wa + wb > 1e-6 ? (wa * ca + wb * cb) / (wa + wb) : mix(ca, cb, t);\
+                mc = mix(mc, sum * cp, agree);                                  \
+            }                                                                   \
+        }                                                                       \
+        return mc / sum;                                                        \
+    }
+#pragma GLSL /* frame_interp_gather */                                          \
+    vec4 color;                                                                 \
+    {                                                                           \
+    float t = ${dynamic float: t};                                              \
+    vec2 pa = ${pos[0]}, pb = ${pos[1]};                                        \
+    ivec2 size = ivec2(${const int: w}, ${const int: h});                       \
+    vec2 fsz = vec2(size);                                                      \
+    vec2 isz = 1.0 / fsz;                                                       \
+    vec2 P = pa * fsz;                                                          \
+    vec2 c0 = P - 0.5;                                                          \
+    float pitch = ${float: pitch};                                              \
+    vec2 grid = P / pitch - 0.5;                                                \
+    vec2 base = floor(grid), frac = grid - base;                                \
+    vec4 ck[8], dk[8]; vec2 vk[8], sk[8], s0[8]; float wk[8], ek[8], w0[8], e0[8];\
+    float tot0 = 0.0, totv = 0.0;                                               \
+    float gate = 1.0;                                                           \
+    @if (qb) {                                                                  \
+        vec2 qg = P / ${const float: (float) qb} - 0.5;                         \
+        ivec2 q0 = ivec2(floor(qg)); vec2 qf = qg - vec2(q0);                   \
+        ivec2 qs = ivec2(${const int: qgw}, ${const int: qgh}) - 1;             \
+        float qv = 0.0;                                                         \
+        for (int j = 0; j < 4; j++) {                                           \
+            ivec2 o = ivec2(j & 1, j >> 1);                                     \
+            ivec2 qq = clamp(q0 + o, ivec2(0), qs);                             \
+            vec2 bw = mix(1.0 - qf, qf, vec2(o));                               \
+            qv += bw.x * bw.y * uintBitsToFloat(g_qual[qq.y * ${const int: qgw} + qq.x]);\
+        }                                                                       \
+        gate = 1.0 - smoothstep(${float: qlo}, ${float: qhi}, qv);              \
+    @}                                                                          \
+    for (int k = 0; k < 8; k++) {                                               \
+        int d = k >> 2;                                                         \
+        vec2 off = vec2(k & 1, (k >> 1) & 1);                                   \
+        vec2 x = (base + off + 0.5) * pitch;                                    \
+        float tau = d == 0 ? t : 1.0 - t;                                       \
+        ivec2 xi = clamp(ivec2(floor(x)), ivec2(0), size - 1);                  \
+        vec4 f = d == 0 ? texelFetch($fwd, xi, 0) : texelFetch($bwd, xi, 0);    \
+        for (int it = 0; it < ${const int: iters}; it++) {                      \
+            xi = clamp(ivec2(floor(x - tau * f.xy)), ivec2(0), size - 1);       \
+            f = d == 0 ? texelFetch($fwd, xi, 0) : texelFetch($bwd, xi, 0);     \
+        }                                                                       \
+        vec2 v = d == 0 ? f.xy : -f.xy;                                         \
+        vec2 bw = mix(1.0 - frac, frac, off);                                   \
+        float wt = bw.x * bw.y * 0.5;                                           \
+        if (${const int: useconf} != 0)                                         \
+            wt *= max(f.z, 0.05);                                               \
+        vec2 qa = c0 - t * v, qb = c0 + (1.0 - t) * v;                          \
+        float ina = g_in(qa, fsz), inb = g_in(qb, fsz);                         \
+        float va = ina, vb = inb;                                               \
+        ivec2 ia = clamp(ivec2(floor(qa + 0.5)), ivec2(0), size - 1);           \
+        ivec2 ib = clamp(ivec2(floor(qb + 0.5)), ivec2(0), size - 1);           \
+        vec4 ca = g_sa((qa + 0.5) * isz), cb = g_sb((qb + 0.5) * isz);          \
+        float lerr = abs(g_luma(ca) - g_luma(cb));                              \
+        /* unvetoed candidate, as the lattice */                                \
+        {                                                                       \
+            float wa = (1.0 - t) * ina, wb = t * inb;                           \
+            e0[k] = wa > 0.0 && wb > 0.0 ? lerr : ${float: sigma};              \
+            dk[k] = wa + wb > 1e-6 ? (wa * ca + wb * cb) / (wa + wb) : mix(ca, cb, t);\
+            w0[k] = wt; s0[k] = vec2(ina, inb);                                 \
+            tot0 += wt * max(ina, inb);                                         \
+        }                                                                       \
+        if (${const int: val} != 0) {                                           \
+            vec2 da = texelFetch($fwd, ia, 0).xy - v;                           \
+            vec2 db = texelFetch($bwd, ib, 0).xy + v;                           \
+            @if (gv4) {                                                         \
+                ivec2 ja = ivec2(floor(qa)), jb = ivec2(floor(qb));             \
+                for (int j = 0; j < 4; j++) {                                   \
+                    ivec2 o = ivec2(j & 1, j >> 1);                             \
+                    vec2 ea = texelFetch($fwd, clamp(ja + o, ivec2(0), size - 1), 0).xy - v;\
+                    vec2 eb = texelFetch($bwd, clamp(jb + o, ivec2(0), size - 1), 0).xy + v;\
+                    if (dot(ea, ea) < dot(da, da)) da = ea;                     \
+                    if (dot(eb, eb) < dot(db, db)) db = eb;                     \
+                }                                                               \
+            @}                                                                  \
+            float isv = 1.0 / (${float: sv} * ${float: sv});                    \
+            float ra = float(splat_src[ia.y * size.x + ia.x].y & 255u) / 255.0; \
+            float rb = float(splat_src[size.x * size.y + ib.y * size.x + ib.x].y & 255u) / 255.0;\
+            va *= 1.0 - gate * ra * (1.0 - exp(-dot(da, da) * isv));            \
+            vb *= 1.0 - gate * rb * (1.0 - exp(-dot(db, db) * isv));            \
+            totv += wt * max(va, vb);                                           \
+            wt *= ${float: vfl} + (1.0 - ${float: vfl}) * max(va, vb);           \
+        }                                                                       \
+        float fr = max(g_front(0, ia, size) * va, g_front(1, ib, size) * vb);   \
+        wt *= exp(${float: beta} * fr * gate);                                  \
+        float wa = (1.0 - t) * va, wb = t * vb;                                 \
+        float both = min(va, vb);                                               \
+        ek[k] = wa > 0.0 && wb > 0.0 ? mix(${float: sigma}, lerr, both) : ${float: sigma};\
+        ck[k] = wa + wb > 1e-6 ? (wa * ca + wb * cb) / (wa + wb) : mix(ca, cb, t);\
+        vk[k] = v; wk[k] = wt; sk[k] = vec2(va, vb);                            \
+    }                                                                           \
+    float sum, sum0;                                                            \
+    vec4 cv = g_blend(ck, vk, sk, wk, ek, c0, t, fsz, isz, sum);                \
+    float fbw = ${float: fallback} * max(1.0 - sum, 0.0);                       \
+    color = mix(g_sa(pa), g_sb(pb), t);                                         \
+    if (sum + fbw > 1e-6)                                                       \
+        color = (cv * sum + fbw * color) / (sum + fbw);                         \
+    @if (surv) {                                                                \
+        /* share of the candidates' weight that survives validation */          \
+        float sv_ = tot0 > 1e-6 ? totv / tot0 : 0.0;                            \
+        float keep = smoothstep(${float: slo}, ${float: shi}, sv_);             \
+        if (keep < 1.0) {                                                       \
+            vec4 c0c = g_blend(dk, vk, s0, w0, e0, c0, t, fsz, isz, sum0);      \
+            if (sum0 > 1e-6)                                                    \
+                color = mix(c0c, color, keep);                                  \
+        }                                                                       \
+    @}                                                                          \
+    @if (soft) {                                                                \
+        ivec2 px = clamp(ivec2(floor(P)), ivec2(0), size - 1);                  \
+        uvec4 acc = soft_acc[px.y * size.x + px.x];                             \
+        float aw = float(acc.w) / 256.0;                                        \
+        if (aw > 0.0) {                                                         \
+            vec4 sc = ${conv[0]}(vec4(vec3(acc.xyz) / (float(acc.w) * 1023.0), 1.0));\
+            color = mix(color, sc, smoothstep(0.0, ${float: softmin}, aw));      \
+        }                                                                       \
+    @}                                                                          \
+    }
+    return true;
+}
+
 static bool frame_interp_splat(pl_shader sh,
                                const struct pl_frame_interp_input *input,
                                const struct pl_color_space *out_color)
@@ -3552,6 +4216,8 @@ static bool frame_interp_splat(pl_shader sh,
     const float t = PL_CLAMP(input->t, 0.0f, 1.0f);
     if (obj->splat.dirty && !splat_prepare(obj, input->gpu, input->dispatch))
         return false;
+    if (dc_env("X_GATHER", 0))
+        return frame_interp_gather(sh, obj, input, out_color, t);
     if (!splat_scatter(obj, input->dispatch, t))
         return false;
 
