@@ -93,6 +93,16 @@ struct sh_motion_obj {
         struct pl_frame_interp_mix_params params;
     } mix;
 
+    // Affine model of the forward motion of the whole frame, as an SSBO
+    // described by `model_var`, fitted on demand by `motion_model_fit`.
+    // `valid` is whether it describes the current frame pair. `acc` is
+    // scratch for fitting it.
+    struct {
+        pl_buf buf;
+        pl_buf acc;
+        bool valid;
+    } model;
+
     // Dimensions of `flow.fwd.elem[0]` (number of blocks to cover the full
     // resolution).
     int grid_w, grid_h;
@@ -687,6 +697,8 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
         pl_tex_destroy(gpu, &obj->mix.tmp[i][1]);
         pl_tex_destroy(gpu, &obj->mix.vec[i]);
     }
+    pl_buf_destroy(gpu, &obj->model.buf);
+    pl_buf_destroy(gpu, &obj->model.acc);
     pl_buf_destroy(gpu, &obj->global.fwd);
     pl_buf_destroy(gpu, &obj->global.bwd);
     pl_buf_destroy(gpu, &obj->global.hist);
@@ -705,6 +717,7 @@ static void invalidate_temporal(pl_gpu gpu, struct sh_motion_obj *obj,
     obj->sig_a = obj->sig_b = 0;
     obj->flow.valid = 0;
     obj->global.valid = false;
+    obj->model.valid = false;
     obj->pyramid_valid = false;
 
     pl_buf_destroy(gpu, &obj->global.fwd);
@@ -2949,6 +2962,7 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
 
     obj->flow.valid = input->direction;
     obj->global.valid = input->estimate_global;
+    obj->model.valid = false;
 
     // Cache frame `b`'s luma pyramid, use reuse `a` buffers as scratch.
     PL_SWAP(obj->pyramid_prev, obj->scratch.levels);
@@ -2961,6 +2975,281 @@ error:
     return false;
 }
 
+// The affine model `mv = mat2x3(model) * vec3(pos, 1)` of the global motion,
+// with `pos` and `mv` in pixels. `model[0..2]` yields `mv.x` and `model[3..5]`
+// yields `mv.y`.
+static const struct pl_buffer_var model_var = {
+    .var = {
+        .name  = "motion_model",
+        .type  = PL_VAR_FLOAT,
+        .dim_v = 1,
+        .dim_m = 1,
+        .dim_a = 6,
+    },
+    .layout = {
+        .size   = 6 * sizeof(float),
+        .stride = sizeof(float),
+    },
+};
+
+// Blocks are summed in tiles of `MOTION_MODEL_TILE_DIM` squared, each into
+// `MOTION_MODEL_SUMS` floats of `sh_motion_obj.model.acc`.
+#define MOTION_MODEL_TILE_DIM 8
+#define MOTION_MODEL_SUMS 12
+
+static struct pl_buffer_var model_acc_var(int num_tiles)
+{
+    return (struct pl_buffer_var) {
+        .var = {
+            .name  = "model_acc",
+            .type  = PL_VAR_FLOAT,
+            .dim_v = 1,
+            .dim_m = 1,
+            .dim_a = num_tiles * MOTION_MODEL_SUMS,
+        },
+        .layout = {
+            .size   = num_tiles * MOTION_MODEL_SUMS * sizeof(float),
+            .stride = sizeof(float),
+        },
+    };
+}
+
+// Accumulates the normal equations of a least squares fit of the affine model
+// to the blocks of `flow` into `acc`. Unless this is
+// the `first` iteration, leaves out the blocks further than `inlier_dist` from
+// the model currently in `model`. Positions are scaled to [-1, 1] for the fit,
+// to keep the sums well conditioned.
+static bool motion_model_acc_pass(pl_gpu gpu, pl_dispatch dispatch, pl_tex flow,
+                                  int bs, int w, int h, pl_buf acc,
+                                  pl_buf model, bool first, float inlier_dist)
+{
+    const int grid_w = flow->params.w, grid_h = flow->params.h;
+    const int dim = MOTION_MODEL_TILE_DIM;
+    const int tiles_w = PL_DIV_UP(grid_w, dim), tiles_h = PL_DIV_UP(grid_h, dim);
+    const struct pl_buffer_var acc_var = model_acc_var(tiles_w * tiles_h);
+
+    pl_shader sh = pl_dispatch_begin(dispatch);
+    sh_describef(sh, "motion model accumulation (%dx%d blocks)", grid_w, grid_h);
+    sh->output = PL_SHADER_SIG_NONE;
+
+    // One thread per tile: the sums are too few to be worth reducing over
+    // shared memory.
+    if (!sh_try_compute(sh, 1, 1, false, 0)) {
+        PL_ERR(gpu, "pl_shader_frame_interp: cannot create motion model "
+               "accumulation shader!");
+        goto error;
+    }
+
+    ident_t src = bind_tex(sh, "flow_in", flow);
+    bind_buf(sh, "model_acc_buf", acc, PL_DESC_ACCESS_WRITEONLY, &acc_var, 1);
+    if (!first) {
+        bind_buf(sh, "motion_model_buf", model, PL_DESC_ACCESS_READONLY,
+                 &model_var, 1);
+    }
+
+    // clang-format off
+#pragma GLSL /* motion_model_acc_pass */                                        \
+    ivec2 grid = ivec2(${const int: grid_w}, ${const int: grid_h});             \
+    vec2 size = vec2(${const float: w}, ${const float: h});                     \
+    ivec2 tile = ivec2(gl_WorkGroupID.xy);                                      \
+    /* Upper triangle of sum(w * p * p^T), then sum(w * p * mv.x) and           \
+     * sum(w * p * mv.y), for p = vec3(pos, 1). */                               \
+    float s[${const int: MOTION_MODEL_SUMS}];                                   \
+    for (int i = 0; i < ${const int: MOTION_MODEL_SUMS}; i++)                   \
+        s[i] = 0.0;                                                             \
+    for (int y = 0; y < ${const int: dim}; y++) {                               \
+        for (int x = 0; x < ${const int: dim}; x++) {                           \
+            ivec2 blk = tile * ${const int: dim} + ivec2(x, y);                 \
+            if (any(greaterThanEqual(blk, grid)))                               \
+                continue;                                                       \
+            vec2 flow = texelFetch($src, blk, 0).xy;                            \
+            vec2 px = min((vec2(blk) + vec2(0.5)) * ${const float: bs}, size);  \
+            vec3 p = vec3(px / size * 2.0 - vec2(1.0), 1.0);                    \
+            float w = 1.0;                                                      \
+            @if (!first) {                                                      \
+                vec3 q = vec3(px, 1.0);                                         \
+                vec2 mv = vec2(dot(vec3(motion_model[0], motion_model[1],       \
+                                        motion_model[2]), q),                   \
+                               dot(vec3(motion_model[3], motion_model[4],       \
+                                        motion_model[5]), q));                  \
+                if (distance(flow, mv) >= ${float: inlier_dist})                \
+                    w = 0.0;                                                    \
+            @}                                                                  \
+            s[0]  += w * p.x * p.x;                                             \
+            s[1]  += w * p.x * p.y;                                             \
+            s[2]  += w * p.x;                                                   \
+            s[3]  += w * p.y * p.y;                                             \
+            s[4]  += w * p.y;                                                   \
+            s[5]  += w;                                                         \
+            s[6]  += w * p.x * flow.x;                                          \
+            s[7]  += w * p.y * flow.x;                                          \
+            s[8]  += w * flow.x;                                                \
+            s[9]  += w * p.x * flow.y;                                          \
+            s[10] += w * p.y * flow.y;                                          \
+            s[11] += w * flow.y;                                                \
+        }                                                                       \
+    }                                                                           \
+    int base = (tile.y * ${const int: tiles_w} + tile.x) *                      \
+               ${const int: MOTION_MODEL_SUMS};                                 \
+    for (int i = 0; i < ${const int: MOTION_MODEL_SUMS}; i++)                   \
+        model_acc[base + i] = s[i];
+    // clang-format on
+
+    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+        .shader        = &sh,
+        .dispatch_size = { tiles_w, tiles_h, 1 },
+    ));
+
+error:
+    pl_dispatch_abort(dispatch, &sh);
+    return false;
+}
+
+// Solves the normal equations that `motion_model_acc_pass` left in `acc`, and
+// writes the result to `model`, converted to pixel positions.
+static bool motion_model_solve_pass(pl_gpu gpu, pl_dispatch dispatch,
+                                    pl_buf acc, int num_tiles, int w, int h,
+                                    pl_buf model)
+{
+    const struct pl_buffer_var acc_var = model_acc_var(num_tiles);
+
+    pl_shader sh = pl_dispatch_begin(dispatch);
+    sh_describef(sh, "motion model solve (%d tiles)", num_tiles);
+    sh->output = PL_SHADER_SIG_NONE;
+
+    // `lanes` threads per sum, each over every `lanes`-th tile
+    const int sums = MOTION_MODEL_SUMS, lanes = 16;
+    if (!sh_try_compute(sh, lanes, sums, false,
+                        sums * lanes * sizeof(float))) {
+        PL_ERR(gpu, "pl_shader_frame_interp: cannot create motion model solve "
+               "shader!");
+        goto error;
+    }
+
+    bind_buf(sh, "model_acc_buf", acc, PL_DESC_ACCESS_READONLY, &acc_var, 1);
+    bind_buf(sh, "motion_model_buf", model, PL_DESC_ACCESS_WRITEONLY,
+             &model_var, 1);
+
+    // clang-format off
+#pragma GLSLH /* motion_model_solve_pass */                                     \
+    shared float s_sums[${const int: sums}][${const int: lanes}];
+
+#pragma GLSL /* motion_model_solve_pass */                                      \
+    int lane = int(gl_LocalInvocationID.x), idx = int(gl_LocalInvocationID.y);  \
+    float sum = 0.0;                                                            \
+    for (int t = lane; t < ${const int: num_tiles}; t += ${const int: lanes})   \
+        sum += model_acc[t * ${const int: sums} + idx];                         \
+    s_sums[idx][lane] = sum;                                                    \
+    barrier();                                                                  \
+                                                                                \
+    if (lane == 0 && idx == 0) {                                                \
+    float s[${const int: sums}];                                                \
+    for (int i = 0; i < ${const int: sums}; i++) {                              \
+        s[i] = 0.0;                                                             \
+        for (int l = 0; l < ${const int: lanes}; l++)                           \
+            s[i] += s_sums[i][l];                                               \
+    }                                                                           \
+    /* Bias a badly conditioned fit, e.g. to blocks along a single line,        \
+     * towards a pure translation. */                                           \
+    float reg = 1e-4 * s[5];                                                    \
+    mat3 A = mat3(s[0] + reg, s[1],       s[2],                                 \
+                  s[1],       s[3] + reg, s[4],                                 \
+                  s[2],       s[4],       s[5]);                                \
+    /* Without any confident block, there is no motion. */                      \
+    vec3 mx = vec3(0.0), my = vec3(0.0);                                        \
+    float det = determinant(A);                                                 \
+    if (s[5] > 1e-3 && abs(det) > 1e-20) {                                      \
+        /* inverse() needs GLSL 140; A is symmetric. */                         \
+        mat3 Ai = mat3(A[1][1] * A[2][2] - A[2][1] * A[1][2],                   \
+                       A[2][1] * A[0][2] - A[0][1] * A[2][2],                   \
+                       A[0][1] * A[1][2] - A[1][1] * A[0][2],                   \
+                       A[2][0] * A[1][2] - A[1][0] * A[2][2],                   \
+                       A[0][0] * A[2][2] - A[2][0] * A[0][2],                   \
+                       A[1][0] * A[0][2] - A[0][0] * A[1][2],                   \
+                       A[1][0] * A[2][1] - A[2][0] * A[1][1],                   \
+                       A[2][0] * A[0][1] - A[0][0] * A[2][1],                   \
+                       A[0][0] * A[1][1] - A[1][0] * A[0][1]) / det;            \
+        mx = Ai * vec3(s[6], s[7], s[8]);                                       \
+        my = Ai * vec3(s[9], s[10], s[11]);                                     \
+    }                                                                           \
+    /* From pos * 2 / size - 1 to pixel positions. */                           \
+    vec2 scale = vec2(2.0) / vec2(${const float: w}, ${const float: h});        \
+    motion_model[0] = mx.x * scale.x;                                           \
+    motion_model[1] = mx.y * scale.y;                                           \
+    motion_model[2] = mx.z - mx.x - mx.y;                                       \
+    motion_model[3] = my.x * scale.x;                                           \
+    motion_model[4] = my.y * scale.y;                                           \
+    motion_model[5] = my.z - my.x - my.y;                                       \
+    }
+    // clang-format on
+
+    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+        .shader        = &sh,
+        .dispatch_size = { 1, 1, 1 },
+    ));
+
+error:
+    pl_dispatch_abort(dispatch, &sh);
+    return false;
+}
+
+// Refits of the affine model to the blocks within MOTION_MODEL_INLIER pixels
+// of the previous fit.
+#define MOTION_MODEL_REFITS 2
+#define MOTION_MODEL_INLIER 4.0f
+
+// Fits the affine model of the global motion to the forward block field of
+// the current frame pair, into `obj->model.buf`, unless it is already there.
+static bool motion_model_fit(pl_gpu gpu, pl_dispatch dispatch,
+                             struct sh_motion_obj *obj)
+{
+    if (obj->model.valid)
+        return true;
+
+    pl_tex flow = obj->flow.fwd.elem[0];
+    const int num_tiles = PL_DIV_UP(flow->params.w, MOTION_MODEL_TILE_DIM) *
+                          PL_DIV_UP(flow->params.h, MOTION_MODEL_TILE_DIM);
+
+    const size_t acc_size = model_acc_var(num_tiles).layout.size;
+    if (obj->model.acc && obj->model.acc->params.size != acc_size)
+        pl_buf_destroy(gpu, &obj->model.acc);
+    if (!obj->model.acc) {
+        obj->model.acc = pl_buf_create(gpu, pl_buf_params(
+            .size      = acc_size,
+            .storable  = true,
+            .debug_tag = PL_DEBUG_TAG,
+        ));
+    }
+    if (!obj->model.buf) {
+        obj->model.buf = pl_buf_create(gpu, pl_buf_params(
+            .size      = model_var.layout.size,
+            .storable  = true,
+            .debug_tag = PL_DEBUG_TAG,
+        ));
+    }
+    if (!obj->model.acc || !obj->model.buf) {
+        PL_ERR(gpu, "pl_shader_frame_interp: failed creating motion model "
+               "buffers!");
+        return false;
+    }
+
+    obj->model.valid = false;
+    for (int i = 0; i <= MOTION_MODEL_REFITS; i++) {
+        if (!motion_model_acc_pass(gpu, dispatch, flow, obj->params.block_size,
+                                   obj->w, obj->h, obj->model.acc,
+                                   obj->model.buf, i == 0, MOTION_MODEL_INLIER))
+            return false;
+        if (!motion_model_solve_pass(gpu, dispatch, obj->model.acc, num_tiles,
+                                     obj->w, obj->h, obj->model.buf))
+            return false;
+    }
+
+    obj->model.valid = true;
+    return true;
+}
+
+// Mixes the two frames, each sampled at the position offset by the global
+// motion, scaled by the frame's distance in time to the intermediate frame.
 // Mixes the two frames, each sampled at the position offset by the global
 // motion, scaled by the frame's distance in time to the intermediate frame.
 static bool frame_interp_global(pl_shader sh,
@@ -3693,8 +3982,13 @@ static bool frame_interp_mix(pl_shader sh,
     const float inv_sigma = 1.0f / PL_SQUARE(PL_MAX(mp->sigma, 1e-3f));
     const int pick = mp->pick, fallback = mp->fallback, show = mp->show;
     const int stest = mp->static_test;
-    const bool local = fallback == 2 || fallback == 3 || fallback == 5, sharp = mp->sharp;
-    const int ncand = fallback == 5 ? 12 : 10;
+    const bool local = fallback == 2 || fallback == 3 || fallback == 5 || fallback == 7;
+    const bool sharp = mp->sharp, affine = fallback >= 6;
+    const int ncand = fallback == 7 ? 13 : fallback == 5 ? 12 : 10;
+    if (affine) {
+        bind_buf(sh, "motion_model_buf", obj->model.buf, PL_DESC_ACCESS_READONLY,
+                 &model_var, 1);
+    }
     const int neigh = PL_CLAMP((int) roundf(mp->neigh), 0, 64);
     ident_t blkf = NULL_IDENT, blkb = NULL_IDENT;
     if (local) {
@@ -3762,6 +4056,16 @@ static bool frame_interp_mix(pl_shader sh,
     vec2 vf = texelFetch($fwd, ip, 0).xy, vb = -texelFetch($bwd, ip, 0).xy; \
     vec2 v = vf; \
     float side = 0.0; \
+    @if (affine) { \
+    /* the model's motion of what is at this pixel at t: x = p + t (M p + c) */ \
+    mat2 am = mat2(motion_model[0], motion_model[3], motion_model[1], motion_model[4]); \
+    vec2 ao = vec2(motion_model[2], motion_model[5]); \
+    mat2 ab = mat2(1.0) + t * am; \
+    float adet = ab[0][0] * ab[1][1] - ab[1][0] * ab[0][1]; \
+    vec2 ax = P - t * ao; \
+    vec2 ap = abs(adet) > 1e-3 ? mat2(ab[1][1], -ab[0][1], -ab[1][0], ab[0][0]) * ax / adet : ax; \
+    vec2 va = am * ap + ao; \
+    @} \
     @if (pick == 1) { \
     if (t > 0.5) { \
         v = vb; \
@@ -3804,6 +4108,10 @@ static bool frame_interp_mix(pl_shader sh,
             vk = 0.5 * (textureLod($blkf, bp, 0.0).xy - textureLod($blkb, bp, 0.0).xy); \
         } \
         @} \
+        @if (ncand > 12) { \
+        if (k == 12) \
+            vk = va; \
+        @} \
         vec2 ek = m_eval(c0, vk, t); \
         vec2 ka = c0 - t * vk, kb = c0 + (1.0 - t) * vk; \
         vec4 ca = m_sa((ka + 0.5) * isz), cb = m_sb((kb + 0.5) * isz); \
@@ -3816,6 +4124,10 @@ static bool frame_interp_mix(pl_shader sh,
         /* test rejects */ \
         float wf = exp(-ph * ph * ${float: inv_sigma}) \
                  * (1.0 - ek.y * (1.0 - exp(-4.0 * dot(vk, vk)))) + 1e-9; \
+        @if (ncand > 12) { \
+        if (k == 12) \
+            wf *= ${float: mp->affine}; \
+        @} \
         fs += wf * ck; \
         fw += wf; \
         gs += wk * ck; \
@@ -3861,7 +4173,12 @@ static bool frame_interp_mix(pl_shader sh,
     still = m_eval(c0, V, t).y; \
     wv = 1.0; \
     @} \
-    @if (fallback >= 1 && fallback <= 3) { \
+    @if (fallback == 6) { \
+    V = va; \
+    still = m_eval(c0, V, t).y; \
+    wv = 1.0; \
+    @} \
+    @if ((fallback >= 1 && fallback <= 3) || fallback == 6) { \
     vec4 fa = m_sa((c0 - t * V + 0.5) * isz), fb = m_sb((c0 + (1.0 - t) * V + 0.5) * isz); \
     float ev1 = abs(m_luma(fa) - m_luma(fb)); \
     @if (fallback == 3) \
@@ -3873,7 +4190,7 @@ static bool frame_interp_mix(pl_shader sh,
     F = mix(F, ua + ub > 0.0 ? (ua * fa + ub * fb) / (ua + ub) : mix(fa, fb, t), wv); \
     ef = mix(ef, ev1, wv); \
     @} \
-    @if (fallback >= 4 && neigh > 0) \
+    @if ((fallback == 4 || fallback == 5 || fallback == 7) && neigh > 0) \
         F = (fs + ${float: mp->giveup} * F) / (fw + ${float: mp->giveup}); \
     @if (veto) { \
     float eg = max(abs(m_luma(ga) - m_luma(gb)) - ef, 0.0); \
@@ -3931,6 +4248,8 @@ bool pl_shader_frame_interp(pl_shader sh,
         return false;
     }
 
+    const bool mix_affine = params->algo == PL_FRAME_INTERP_MIX &&
+                            params->mix.fallback >= 6;
     motion_b_request = params->algo == PL_FRAME_INTERP_GATHER ? 1 :
                        params->algo == PL_FRAME_INTERP_MIX ? 2 : 0;
     motion_mix_request = params->mix;
@@ -3962,8 +4281,13 @@ bool pl_shader_frame_interp(pl_shader sh,
         return frame_interp_local(sh, input, params, &out_color);
     case PL_FRAME_INTERP_GATHER:
         return frame_interp_gather(sh, input, &out_color);
-    case PL_FRAME_INTERP_MIX:
+    case PL_FRAME_INTERP_MIX: {
+        struct sh_motion_obj *obj = SH_OBJ_LOOKUP(*input->state, PL_SHADER_OBJ_MOTION,
+                                                  struct sh_motion_obj);
+        if (mix_affine && !motion_model_fit(input->gpu, input->dispatch, obj))
+            return false;
         return frame_interp_mix(sh, input, &params->mix, &out_color);
+    }
     case PL_FRAME_INTERP_ALGO_COUNT:
         break;
     }

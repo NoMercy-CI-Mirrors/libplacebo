@@ -492,7 +492,8 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 static const char *fallbacks[] = {
                     "Plain frame mixing", "Own vector", "Block motion",
                     "None or block motion", "Neighbour vectors",
-                    "Neighbours, none, block",
+                    "Neighbours, none, block", "Affine motion",
+                    "Neighbours, none, block, affine",
                 };
                 static const char *statics[] = {
                     "Off", "Zero vector", "Same in both frames",
@@ -509,7 +510,7 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 mx->pick = nk_combo(nk, picks, 3, mx->pick, 16,
                                     nk_vec2(nk_widget_width(nk), 300));
                 nk_label(nk, "Fallback along:", NK_TEXT_LEFT);
-                mx->fallback = nk_combo(nk, fallbacks, 6, mx->fallback, 16,
+                mx->fallback = nk_combo(nk, fallbacks, 8, mx->fallback, 16,
                                         nk_vec2(nk_widget_width(nk), 300));
                 nk_label(nk, "Static test:", NK_TEXT_LEFT);
                 mx->static_test = nk_combo(nk, statics, 5, mx->static_test, 16,
@@ -525,6 +526,8 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                                   16.0f, 0.1f, 0.01f);
                 nk_property_float(nk, "Plain mixing weight", 0.0f, &mx->giveup,
                                   4.0f, 0.01f, 0.001f);
+                nk_property_float(nk, "Affine weight", 0.0f, &mx->affine,
+                                  64.0f, 0.1f, 0.01f);
                 nk_property_float(nk, "Photometric veto", 0.0f, &mx->veto,
                                   1.0f, 0.01f, 0.001f);
                 nk_checkbox_label(nk, "Bicubic sample", &mx->sharp);

@@ -380,7 +380,8 @@ struct pl_frame_interp_mix_params {
     // 1 = the pixel's own vector, 2 = the smooth block motion around it, 3 =
     // per pixel none or 2, by how well the frames then agree, 4 = instead of
     // one V, the vectors `neigh` adds, weighed by how well the frames agree
-    // along each, 5 = like 4, with none and 2 among them.
+    // along each, 5 = like 4, with none and 2 among them, 6 = an affine model
+    // of the motion of the whole frame, 7 = like 5, with 6 among them.
     int fallback;
 
     // A moving V yields to plain frame mixing where it samples a static
@@ -397,6 +398,10 @@ struct pl_frame_interp_mix_params {
     // each of which weighs up to 1. Where the frames agree along none of
     // them, or `static_test` rejects them, this is what remains.
     float giveup;
+
+    // For `fallback` = 7: weight of the affine model next to the other
+    // vectors, each of which weighs up to 1.
+    float affine;
 
     // Difference, in the square root of the luma, between the two
     // compensated samples at which Q falls to 1/e, beyond the difference
@@ -418,7 +423,7 @@ struct pl_frame_interp_mix_params {
     .q_cost_flat = 6.0f, .q_border = 1.0f, .fill = true,                       \
     .clean = 1, .soften = 1.5f, .static_thresh = 1.0f, .pick = 2,              \
     .consist = 2.0f, .fallback = 5, .static_test = 4, .sigma = 0.2f,           \
-    .giveup = 2.0f, .neigh = 4.0f, .sharp = true,
+    .giveup = 2.0f, .affine = 1.0f, .neigh = 4.0f, .sharp = true,
 
 // Tunable parameters. Kept separate from the per-call inputs so that callers
 // can reuse unchanging configurations.
