@@ -84,6 +84,15 @@ struct sh_motion_obj {
         pl_tex cost[2], front[2], quality;
     } gather;
 
+    // State of `frame_interp_mix`, see `motion_b_post_mix`: the quality of
+    // each direction's vectors as estimated (`raw`) and as read by the
+    // interpolation (`q`, one of `raw` and the scratch textures `tmp`), the
+    // filled vectors, and the parameters they were made with.
+    struct {
+        pl_tex raw[2], tmp[2][2], q[2], vec[2];
+        struct pl_frame_interp_mix_params params;
+    } mix;
+
     // Dimensions of `flow.fwd.elem[0]` (number of blocks to cover the full
     // resolution).
     int grid_w, grid_h;
@@ -672,6 +681,12 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
         pl_tex_destroy(gpu, &obj->gather.front[i]);
     }
     pl_tex_destroy(gpu, &obj->gather.quality);
+    for (int i = 0; i < 2; i++) {
+        pl_tex_destroy(gpu, &obj->mix.raw[i]);
+        pl_tex_destroy(gpu, &obj->mix.tmp[i][0]);
+        pl_tex_destroy(gpu, &obj->mix.tmp[i][1]);
+        pl_tex_destroy(gpu, &obj->mix.vec[i]);
+    }
     pl_buf_destroy(gpu, &obj->global.fwd);
     pl_buf_destroy(gpu, &obj->global.bwd);
     pl_buf_destroy(gpu, &obj->global.hist);
@@ -736,6 +751,31 @@ bool pl_motion_debug_gather_set(pl_shader_obj state, int dir,
     ok = ok && pl_tex_upload(gpu, pl_tex_transfer_params(.tex = qt, .ptr = tmp));
     pl_free(tmp);
     return ok;
+}
+
+bool pl_motion_debug_mix_set(pl_shader_obj state, int dir, const void *flow,
+                             const uint8_t *quality)
+{
+    struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
+                                              struct sh_motion_obj);
+    if (!obj || !obj->mix.q[dir])
+        return false;
+    pl_gpu gpu = state->gpu;
+    pl_tex ft = dir ? obj->flow.dense_bwd : obj->flow.dense_fwd;
+    pl_tex qt = obj->mix.q[dir];
+    if (ft->params.format->texel_size != 4 || qt->params.format->texel_size != 2)
+        return false;
+    return (!flow || pl_tex_upload(gpu, pl_tex_transfer_params(.tex = ft, .ptr = (void *) flow))) &&
+           (!quality || pl_tex_upload(gpu, pl_tex_transfer_params(.tex = qt, .ptr = (void *) quality)));
+}
+
+pl_tex pl_motion_debug_mix_get(pl_shader_obj state, int dir, bool raw)
+{
+    struct sh_motion_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_MOTION,
+                                              struct sh_motion_obj);
+    if (!obj)
+        return NULL;
+    return raw ? obj->mix.raw[dir] : obj->mix.q[dir];
 }
 
 void pl_motion_reset(pl_shader_obj state)
@@ -2090,6 +2130,214 @@ static bool motion_pack_pass(pl_dispatch dp, pl_tex cost[2], pl_buf mark,
         .dispatch_size = { PL_DIV_UP(w, qb), PL_DIV_UP(h, qb), 1 }));
 }
 
+// Set by `pl_shader_frame_interp` for `motion_b_request` = 2.
+static struct pl_frame_interp_mix_params motion_mix_request;
+
+// Whether the parts of `a` and `b` that stage B depends on are the same.
+static bool mix_b_params_eq(const struct pl_frame_interp_mix_params *a,
+                            const struct pl_frame_interp_mix_params *b)
+{
+    return a->q_vis == b->q_vis && a->q_cost_lo == b->q_cost_lo &&
+           a->q_cost_flat == b->q_cost_flat &&
+           a->q_cost_hi == b->q_cost_hi && a->q_outlier == b->q_outlier &&
+           a->q_border == b->q_border &&
+           a->clean == b->clean &&
+           a->soften == b->soften && a->vec_median == b->vec_median &&
+           a->fill == b->fill && a->static_thresh == b->static_thresh;
+}
+
+// Two component format of the quality fields of `frame_interp_mix`.
+static pl_fmt mix_quality_fmt(pl_gpu gpu)
+{
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 2, 8, 8,
+                             PL_FMT_CAP_STORABLE | PL_FMT_CAP_LINEAR);
+    return fmt ? fmt : flow_fmt_n(gpu, 2);
+}
+
+// Median of 9, per component.
+static void sh_median9(pl_shader sh)
+{
+    // clang-format off
+#pragma GLSLH /* sh_median9 */ \
+    void m_sort2(inout vec2 a, inout vec2 b) { \
+        vec2 lo = min(a, b); \
+        b = max(a, b); \
+        a = lo; \
+    } \
+    vec2 m_median9(vec2 p0, vec2 p1, vec2 p2, vec2 p3, vec2 p4, vec2 p5, \
+                   vec2 p6, vec2 p7, vec2 p8) { \
+        m_sort2(p1, p2); m_sort2(p4, p5); m_sort2(p7, p8); \
+        m_sort2(p0, p1); m_sort2(p3, p4); m_sort2(p6, p7); \
+        m_sort2(p1, p2); m_sort2(p4, p5); m_sort2(p7, p8); \
+        m_sort2(p0, p3); m_sort2(p5, p8); m_sort2(p4, p7); \
+        m_sort2(p3, p6); m_sort2(p1, p4); m_sort2(p2, p5); \
+        m_sort2(p4, p7); m_sort2(p4, p2); m_sort2(p6, p4); \
+        m_sort2(p4, p2); \
+        return p4; \
+    }
+    // clang-format on
+}
+
+// Per pixel quality of the vectors of `flow`, into `qual` (x): 1 where the
+// vector can be trusted, falling with every sign that it cannot: the pixel is
+// hidden in the other frame (`vis`), its window matches badly where the vector
+// leads, relative to its own texture, the vector differs from the median of
+// those around it, or leaves the frame. See `pl_frame_interp_mix_params`.
+//
+// `qual` (y) is whether the pixel is static: its surroundings are the same in
+// both frames. The vectors are copied to `out`, or replaced by their median.
+static bool motion_quality_pass(pl_dispatch dp, pl_tex ref, pl_tex tgt,
+                                pl_tex flow, pl_tex vis, pl_tex out, pl_tex qual,
+                                const struct pl_frame_interp_mix_params *mp)
+{
+    const int w = out->params.w, h = out->params.h;
+    pl_shader sh = pl_dispatch_begin(dp);
+    sh_describef(sh, "motion vector quality (%dx%d)", w, h);
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 16, 16, false, 0)) {
+        pl_dispatch_abort(dp, &sh);
+        return false;
+    }
+
+    sh_median9(sh);
+    ident_t src = bind_tex(sh, "flow_in", flow);
+    ident_t vis_id = bind_tex(sh, "vis_in", vis);
+    ident_t ref_id = bind_tex(sh, "ref", ref);
+    ident_t tgt_id = bind_tex_linear(sh, "tgt", tgt);
+    ident_t dst = bind_img(sh, "flow_out", out);
+    ident_t qdst = bind_img(sh, "qual_out", qual);
+    const bool median = mp->vec_median, outlier = mp->q_outlier > 0.0f;
+    const bool cost = mp->q_cost_hi > 0.0f;
+    const float inv_outlier = outlier ? 1.0f / PL_SQUARE(mp->q_outlier) : 0.0f;
+    const float thresh = PL_MAX(mp->static_thresh, 1e-3f) / 255.0f;
+    // clang-format off
+#pragma GLSL /* motion_quality_pass */ \
+    ivec2 size = ivec2(${const int: w}, ${const int: h}); \
+    ivec2 pos  = ivec2(gl_GlobalInvocationID.xy); \
+    if (all(lessThan(pos, size))) { \
+        vec2 f = texelFetch($src, pos, 0).xy; \
+        float q = 1.0; \
+        @if (median || outlier) { \
+        ivec2 lo = max(pos - 1, ivec2(0)), hi = min(pos + 1, size - 1); \
+        vec2 med = m_median9( \
+            texelFetch($src, lo, 0).xy, \
+            texelFetch($src, ivec2(pos.x, lo.y), 0).xy, \
+            texelFetch($src, ivec2(hi.x, lo.y), 0).xy, \
+            texelFetch($src, ivec2(lo.x, pos.y), 0).xy, f, \
+            texelFetch($src, ivec2(hi.x, pos.y), 0).xy, \
+            texelFetch($src, ivec2(lo.x, hi.y), 0).xy, \
+            texelFetch($src, ivec2(pos.x, hi.y), 0).xy, \
+            texelFetch($src, hi, 0).xy); \
+        vec2 dv = f - med; \
+        @if (outlier) \
+            q *= exp(-dot(dv, dv) * ${float: inv_outlier}); \
+        @if (median) \
+            f = med; \
+        @} \
+        /* nothing to match a vector against once it leaves the frame */ \
+        vec2 to = vec2(pos) + vec2(0.5) + f; \
+        bool leaves = any(lessThan(to, vec2(0.0))) || any(greaterThan(to, vec2(size))); \
+        float qleave = ${float: mp->q_border} * q; \
+        if (texelFetch($vis_id, pos, 0).x < 0.5) \
+            q *= ${float: 1.0f - PL_CLAMP(mp->q_vis, 0.0f, 1.0f)}; \
+        float centre = texelFetch($ref_id, pos, 0).r; \
+        float ssd = 0.0, energy = 0.0, sad = 0.0; \
+        for (int j = 0; j < 9; j++) { \
+            ivec2 p = clamp(pos + ivec2(j % 3, j / 3) - 1, ivec2(0), size - 1); \
+            float r = texelFetch($ref_id, p, 0).r; \
+            float d = r - textureLod($tgt_id, (vec2(p) + vec2(0.5) + f) / vec2(size), 0.0).r; \
+            ssd += d * d; \
+            energy += (r - centre) * (r - centre); \
+            sad += abs(r - texelFetch($tgt_id, p, 0).r); \
+        } \
+        @if (cost) { \
+        float c = sqrt(ssd / (energy + ${float: 9.0f * PL_SQUARE(PL_MAX(mp->q_cost_flat, 0.1f) / 255.0f)})); \
+        q *= 1.0 - smoothstep(${float: mp->q_cost_lo}, ${float: mp->q_cost_hi}, c); \
+        @} \
+        if (leaves) \
+            q = qleave; \
+        float still = 1.0 - smoothstep(${float: 0.5f * thresh}, ${float: thresh}, sad / 9.0); \
+        imageStore($dst, pos, vec4(f, 0.0, 0.0)); \
+        imageStore($qdst, pos, vec4(q, still, 0.0, 0.0)); \
+    }
+    // clang-format on
+    return pl_dispatch_compute(dp, pl_dispatch_compute_params(
+        .shader = &sh,
+        .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(h, 16), 1 }));
+}
+
+enum mix_filter {
+    MIX_FILTER_MEDIAN, // 3x3 median of x
+    MIX_FILTER_MIN,    // 3x3 minimum of x
+    MIX_FILTER_BLUR_H, // gaussian of x and y
+    MIX_FILTER_BLUR_V,
+};
+
+// Filters a quality field. Isolated pixels of low or high quality are
+// estimation noise, which would show as speckle if it decided anything per
+// pixel, and the quality should rather be too low than too high around what
+// remains.
+static bool motion_qfilter_pass(pl_dispatch dp, pl_tex src, pl_tex dst,
+                                enum mix_filter filter, float sigma)
+{
+    const int w = dst->params.w, h = dst->params.h;
+    pl_shader sh = pl_dispatch_begin(dp);
+    sh_describef(sh, "motion quality filter %d (%dx%d)", (int) filter, w, h);
+    sh->output = PL_SHADER_SIG_NONE;
+    if (!sh_try_compute(sh, 16, 16, false, 0)) {
+        pl_dispatch_abort(dp, &sh);
+        return false;
+    }
+
+    sh_median9(sh);
+    ident_t in = bind_tex(sh, "qual_in", src);
+    ident_t out = bind_img(sh, "qual_out", dst);
+    const int radius = PL_CLAMP((int) ceilf(2.0f * sigma), 1, 6);
+    const bool vert = filter == MIX_FILTER_BLUR_V;
+    // clang-format off
+#pragma GLSL /* motion_qfilter_pass */ \
+    ivec2 size = ivec2(${const int: w}, ${const int: h}); \
+    ivec2 pos  = ivec2(gl_GlobalInvocationID.xy); \
+    if (all(lessThan(pos, size))) { \
+        vec2 res = texelFetch($in, pos, 0).xy; \
+        ivec2 lo = max(pos - 1, ivec2(0)), hi = min(pos + 1, size - 1); \
+        @if (filter == MIX_FILTER_MEDIAN) { \
+        res.x = m_median9( \
+            texelFetch($in, lo, 0).xy, \
+            texelFetch($in, ivec2(pos.x, lo.y), 0).xy, \
+            texelFetch($in, ivec2(hi.x, lo.y), 0).xy, \
+            texelFetch($in, ivec2(lo.x, pos.y), 0).xy, res, \
+            texelFetch($in, ivec2(hi.x, pos.y), 0).xy, \
+            texelFetch($in, ivec2(lo.x, hi.y), 0).xy, \
+            texelFetch($in, ivec2(pos.x, hi.y), 0).xy, \
+            texelFetch($in, hi, 0).xy).x; \
+        @} \
+        @if (filter == MIX_FILTER_MIN) { \
+        for (int j = 0; j < 9; j++) { \
+            ivec2 p = clamp(pos + ivec2(j % 3, j / 3) - 1, ivec2(0), size - 1); \
+            res.x = min(res.x, texelFetch($in, p, 0).x); \
+        } \
+        @} \
+        @if (filter >= MIX_FILTER_BLUR_H) { \
+        vec2 acc = vec2(0.0); \
+        float sum = 0.0; \
+        for (int i = -${const int: radius}; i <= ${const int: radius}; i++) { \
+            ivec2 p = clamp(pos + i * ivec2(${const int: !vert}, ${const int: vert}), \
+                            ivec2(0), size - 1); \
+            float g = exp(-float(i * i) * ${float: 0.5f / PL_SQUARE(sigma)}); \
+            acc += g * texelFetch($in, p, 0).xy; \
+            sum += g; \
+        } \
+        res = acc / sum; \
+        @} \
+        imageStore($out, pos, vec4(res, 0.0, 0.0)); \
+    }
+    // clang-format on
+    return pl_dispatch_compute(dp, pl_dispatch_compute_params(
+        .shader = &sh,
+        .dispatch_size = { PL_DIV_UP(w, 16), PL_DIV_UP(h, 16), 1 }));
+}
+
 // Two contiguous histograms describing the global motion in the frame.
 // One histogram for each component of the motion vector (x,y).
 static const struct pl_buffer_var global_hist_var = {
@@ -2351,6 +2599,68 @@ static bool motion_b_post(pl_gpu gpu, pl_dispatch dispatch,
     return motion_pack_pass(dispatch, obj->gather.cost, obj->gather.mark, stamp,
                             obj->gather.front, obj->gather.quality);
 }
+
+// Stage B after the per pixel field, for `frame_interp_mix`: occlusion,
+// optionally fill, then the quality of every vector and its cleaning.
+static bool motion_b_post_mix(pl_gpu gpu, pl_dispatch dispatch,
+                              struct sh_motion_obj *obj, pl_tex luma_a, pl_tex luma_b)
+{
+    const struct pl_frame_interp_mix_params *mp = &obj->mix.params;
+    pl_tex luma[2] = { luma_a, luma_b };
+    pl_tex dense[2] = { obj->flow.dense_fwd, obj->flow.dense_bwd };
+    pl_fmt qfmt = mix_quality_fmt(gpu);
+    if (!qfmt)
+        return false;
+
+    for (int d = 0; d < 2; d++) {
+        const int w = dense[d]->params.w, h = dense[d]->params.h;
+        if (!dense_flow_recreate(gpu, &obj->mix.raw[d], w, h, qfmt) ||
+            !dense_flow_recreate(gpu, &obj->mix.tmp[d][0], w, h, qfmt) ||
+            !dense_flow_recreate(gpu, &obj->mix.tmp[d][1], w, h, qfmt) ||
+            !motion_occlusion_pass(gpu, dispatch, luma[d], obj->b_sel[d],
+                                   obj->b_sel[!d], obj->b_occ[d]))
+            return false;
+
+        pl_tex vec = obj->b_sel[d];
+        if (mp->fill) {
+            if (!dense_flow_recreate(gpu, &obj->mix.vec[d], w, h,
+                                     dense[d]->params.format) ||
+                !dense_flow_recreate(gpu, &obj->gather.cost[d], w, h,
+                                     flow_fmt_n(gpu, 1)) ||
+                !motion_fill_pass(gpu, dispatch, luma[d], luma[!d], vec,
+                                  obj->b_occ[d], obj->mix.vec[d],
+                                  obj->gather.cost[d]))
+                return false;
+            vec = obj->mix.vec[d];
+        }
+
+        if (!motion_quality_pass(dispatch, luma[d], luma[!d], vec, obj->b_occ[d],
+                                 dense[d], obj->mix.raw[d], mp))
+            return false;
+
+        enum mix_filter filters[4];
+        int num = 0;
+        if (mp->clean >= 1)
+            filters[num++] = MIX_FILTER_MEDIAN;
+        if (mp->clean >= 2)
+            filters[num++] = MIX_FILTER_MIN;
+        if (mp->soften > 0.0f) {
+            filters[num++] = MIX_FILTER_BLUR_H;
+            filters[num++] = MIX_FILTER_BLUR_V;
+        }
+
+        pl_tex cur = obj->mix.raw[d];
+        for (int i = 0; i < num; i++) {
+            pl_tex next = obj->mix.tmp[d][i & 1];
+            if (!motion_qfilter_pass(dispatch, cur, next, filters[i], mp->soften))
+                return false;
+            cur = next;
+        }
+        obj->mix.q[d] = cur;
+    }
+
+    return true;
+}
 bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
                         const struct pl_motion_estimate_params *params)
 {
@@ -2383,11 +2693,14 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
     // EXPERIMENT: stage B needs both directions
     const int bmode = input->direction == PL_MOTION_BOTH
                     ? motion_b_request : 0;
-    if (bmode != obj->b_mode) {
+    if (bmode != obj->b_mode ||
+        (bmode == 2 && !mix_b_params_eq(&obj->mix.params, &motion_mix_request)))
+    {
         changed = "parameters changed";
         obj->b_mode = bmode;
         obj->sig_a = obj->sig_b = 0;
     }
+    obj->mix.params = motion_mix_request;
 
     if (changed) {
         invalidate_temporal(gpu, obj, changed);
@@ -2618,8 +2931,11 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
     if (!ok)
         goto error;
 
-    if (bmode && !motion_b_post(gpu, input->dispatch, obj, obj->pyramid_prev.elem[0],
-                                obj->scratch.levels.elem[0]))
+    if (bmode == 1 && !motion_b_post(gpu, input->dispatch, obj, obj->pyramid_prev.elem[0],
+                                     obj->scratch.levels.elem[0]))
+        goto error;
+    if (bmode == 2 && !motion_b_post_mix(gpu, input->dispatch, obj, obj->pyramid_prev.elem[0],
+                                         obj->scratch.levels.elem[0]))
         goto error;
 
     obj->flow.valid = input->direction;
@@ -3097,7 +3413,8 @@ static bool frame_interp_local(pl_shader sh,
     return true;
 }
 
-// Binds both frames of `input` for `frame_interp_gather`: per frame, the texture, its position and texel size,
+// Binds both frames of `input` for `frame_interp_gather` and
+// `frame_interp_mix`: per frame, the texture, its position and texel size,
 // the conversion to `out_color` (`conv`, a function) and a bicubic sampler
 // including that conversion (`cubic`).
 static bool interp_bind_frames(pl_shader sh,
@@ -3326,6 +3643,244 @@ static bool frame_interp_gather(pl_shader sh,
     return true;
 }
 
+// out = mix(F, G, Q): G is both frames sampled along the pixel's own vector,
+// read from the per pixel fields at the pixel itself, F a fallback blend
+// (plain frame mixing unless `mp->fallback`), and Q the quality of the vector
+// at the pixels it samples (see `motion_b_post_mix`). With Q = 0 this is F, so
+// it can only be worse than F where Q is too high.
+//
+// The two fields hold the vector of what is at the pixel in their own frame.
+// Content that moves by less than its length is at the pixel in at least one
+// of the two frames, so one of the two vectors is the right one: the one of
+// higher quality (`mp->pick`).
+static bool frame_interp_mix(pl_shader sh,
+                             const struct pl_frame_interp_input *input,
+                             const struct pl_frame_interp_mix_params *mp,
+                             const struct pl_color_space *out_color)
+{
+    struct sh_motion_obj *obj = SH_OBJ_LOOKUP(*input->state, PL_SHADER_OBJ_MOTION,
+                                              struct sh_motion_obj);
+    if (!obj || obj->flow.valid != PL_MOTION_BOTH || obj->b_mode != 2 ||
+        !obj->mix.q[0] || !obj->mix.q[1])
+    {
+        PL_ERR(sh, "pl_shader_frame_interp: no flow fields available!");
+        return false;
+    }
+
+    const float t = PL_CLAMP(input->t, 0.0f, 1.0f);
+    ident_t conv[2], tex[2], pos[2], pt[2], cubic[2];
+    if (!interp_bind_frames(sh, input, out_color, "frame interpolation (mix)",
+                            conv, tex, pos, pt, cubic))
+        return false;
+
+    const int w = obj->flow.dense_fwd->params.w, h = obj->flow.dense_fwd->params.h;
+    ident_t fwd = bind_tex(sh, "m_fwd", obj->flow.dense_fwd);
+    ident_t bwd = bind_tex(sh, "m_bwd", obj->flow.dense_bwd);
+    ident_t qfwd = bind_tex_linear(sh, "m_qfwd", obj->mix.q[0]);
+    ident_t qbwd = bind_tex_linear(sh, "m_qbwd", obj->mix.q[1]);
+    const bool consist = mp->consist > 0.0f, veto = mp->veto > 0.0f;
+    const float inv_consist = consist ? 1.0f / PL_SQUARE(mp->consist) : 0.0f;
+    const float inv_veto = veto ? 1.0f / PL_SQUARE(mp->veto) : 0.0f;
+    const float inv_sigma = 1.0f / PL_SQUARE(PL_MAX(mp->sigma, 1e-3f));
+    const int pick = mp->pick, fallback = mp->fallback, show = mp->show;
+    const int stest = mp->static_test;
+    const bool local = fallback == 2 || fallback == 3 || fallback == 5, sharp = mp->sharp;
+    const int ncand = fallback == 5 ? 12 : 10;
+    const int neigh = PL_CLAMP((int) roundf(mp->neigh), 0, 64);
+    ident_t blkf = NULL_IDENT, blkb = NULL_IDENT;
+    if (local) {
+        blkf = bind_tex_linear(sh, "m_blkf", obj->flow.fwd.elem[0]);
+        blkb = bind_tex_linear(sh, "m_blkb", obj->flow.bwd.elem[0]);
+    }
+    // Size of the block grid in pixels
+    const float bgw = obj->grid_w * obj->params.block_size,
+                bgh = obj->grid_h * obj->params.block_size;
+
+    // clang-format off
+#pragma GLSLH /* frame_interp_mix */ \
+    vec4 m_sa(vec2 p) { return ${conv[0]}(textureLod(${tex[0]}, p, 0.0)); } \
+    vec4 m_sb(vec2 p) { return ${conv[1]}(textureLod(${tex[1]}, p, 0.0)); } \
+    float m_in(vec2 p, vec2 sz) { \
+        return all(greaterThanEqual(p, vec2(-0.5))) && \
+               all(lessThanEqual(p, sz - 0.5)) ? 1.0 : 0.0; \
+    } \
+    float m_luma(vec4 c) { \
+        return sqrt(max(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0)); \
+    } \
+    /* Quality of the vector `v` at the pixel centred on `c`, and whether */ \
+    /* it samples a static pixel in either frame */ \
+    vec2 m_eval(vec2 c, vec2 v, float t) { \
+        ivec2 size = ivec2(${const int: w}, ${const int: h}); \
+        vec2 fsz = vec2(size); \
+        vec2 qa = c - t * v, qb = c + (1.0 - t) * v; \
+        vec2 sa = textureLod($qfwd, (qa + 0.5) / fsz, 0.0).xy; \
+        vec2 sb = textureLod($qbwd, (qb + 0.5) / fsz, 0.0).xy; \
+        /* a side that is out of the frame does not count */ \
+        float ina = m_in(qa, fsz), inb = m_in(qb, fsz); \
+        float q = min(mix(1.0, sa.x, ina), mix(1.0, sb.x, inb)) * max(ina, inb); \
+        float still = 0.0; \
+        @if (consist || stest == 1) { \
+        ivec2 ia = clamp(ivec2(floor(qa + 0.5)), ivec2(0), size - 1); \
+        ivec2 ib = clamp(ivec2(floor(qb + 0.5)), ivec2(0), size - 1); \
+        vec2 fa = texelFetch($fwd, ia, 0).xy, fb = texelFetch($bwd, ib, 0).xy; \
+        @if (consist) { \
+        vec2 da = fa - v, db = fb + v; \
+        q *= exp(-max(ina * dot(da, da), inb * dot(db, db)) * ${float: inv_consist}); \
+        @} \
+        @if (stest == 1) \
+            still = max(exp(-4.0 * dot(fa, fa)), exp(-4.0 * dot(fb, fb))); \
+        @} \
+        @if (stest == 2) \
+            still = max(sa.y, sb.y); \
+        return vec2(q, still); \
+    }
+
+#pragma GLSL /* frame_interp_mix */ \
+    vec4 color; \
+    { \
+    float t = ${dynamic float: t}; \
+    vec2 pa = ${pos[0]}, pb = ${pos[1]}; \
+    ivec2 size = ivec2(${const int: w}, ${const int: h}); \
+    vec2 fsz = vec2(size); \
+    vec2 isz = 1.0 / fsz; \
+    vec2 P = pa * fsz; \
+    vec2 c0 = P - 0.5; \
+    ivec2 ip = clamp(ivec2(floor(P)), ivec2(0), size - 1); \
+    vec2 vf = texelFetch($fwd, ip, 0).xy, vb = -texelFetch($bwd, ip, 0).xy; \
+    vec2 v = vf; \
+    float side = 0.0; \
+    @if (pick == 1) { \
+    if (t > 0.5) { \
+        v = vb; \
+        side = 1.0; \
+    } \
+    @} \
+    vec2 ev = m_eval(c0, v, t); \
+    @if (pick >= 2) { \
+    vec2 eb = m_eval(c0, vb, t); \
+    /* equally good: the nearer frame's */ \
+    if (eb.x > ev.x + (t > 0.5 ? -0.02 : 0.02)) { \
+        v = vb; \
+        ev = eb; \
+        side = 1.0; \
+    } \
+    @} \
+    float Q = ev.x; \
+    @if (neigh > 0) { \
+    /* the vectors of both fields at the pixel and around it, each weighed */ \
+    /* by its quality and by how well the two frames agree along it */ \
+    vec4 gs = vec4(0.0), fs = vec4(0.0); \
+    float fw = 0.0; \
+    vec2 vs = vec2(0.0); \
+    float ws = 0.0, qs = 0.0, v2 = 0.0; \
+    for (int k = 0; k < ${const int: ncand}; k++) { \
+        ivec2 o = ivec2(0); \
+        if (k >= 2) { \
+            int j = (k - 2) >> 1; \
+            int n = (j & 1) == 0 ? ${const int: neigh} : -${const int: neigh}; \
+            o = (j & 2) == 0 ? ivec2(n, 0) : ivec2(0, n); \
+        } \
+        ivec2 pk = clamp(ip + o, ivec2(0), size - 1); \
+        vec2 vk = (k & 1) == 0 ? texelFetch($fwd, pk, 0).xy : -texelFetch($bwd, pk, 0).xy; \
+        @if (ncand > 10) { \
+        /* no motion, and the smooth block motion */ \
+        if (k == 10) \
+            vk = vec2(0.0); \
+        if (k == 11) { \
+            vec2 bp = P / vec2(${const float: bgw}, ${const float: bgh}); \
+            vk = 0.5 * (textureLod($blkf, bp, 0.0).xy - textureLod($blkb, bp, 0.0).xy); \
+        } \
+        @} \
+        vec2 ek = m_eval(c0, vk, t); \
+        vec2 ka = c0 - t * vk, kb = c0 + (1.0 - t) * vk; \
+        vec4 ca = m_sa((ka + 0.5) * isz), cb = m_sb((kb + 0.5) * isz); \
+        float ia = m_in(ka, fsz), ib = m_in(kb, fsz); \
+        float ph = ia * ib * abs(m_luma(ca) - m_luma(cb)); \
+        float wk = (ek.x + 0.02) * exp(-ph * ph * ${float: inv_sigma}) + 1e-9; \
+        float ua = (1.0 - t) * ia, ub = t * ib; \
+        vec4 ck = ua + ub > 0.0 ? (ua * ca + ub * cb) / (ua + ub) : mix(ca, cb, t); \
+        /* for the fallback, by the agreement alone */ \
+        float wf = exp(-ph * ph * ${float: inv_sigma}) + 1e-9; \
+        fs += wf * ck; \
+        fw += wf; \
+        gs += wk * ck; \
+        vs += wk * vk; \
+        ws += wk; \
+        qs += wk * ek.x; \
+        v2 += wk * dot(vk, vk); \
+    } \
+    v = vs / ws; \
+    Q = qs / ws; \
+    /* where they agree, one sample along their mean instead */ \
+    float agree = exp(-max(v2 / ws - dot(v, v), 0.0)); \
+    @if (fallback == 1) \
+        ev.y = m_eval(c0, v, t).y; \
+    @} \
+    vec2 qa = c0 - t * v, qb = c0 + (1.0 - t) * v; \
+    vec4 za = m_sa(pa), zb = m_sb(pb); \
+    vec4 ga, gb; \
+    @if (sharp) { \
+    ga = ${cubic[0]}((qa + 0.5) * isz); \
+    gb = ${cubic[1]}((qb + 0.5) * isz); \
+    @} else { \
+    ga = m_sa((qa + 0.5) * isz); \
+    gb = m_sb((qb + 0.5) * isz); \
+    @} \
+    float wa = (1.0 - t) * m_in(qa, fsz), wb = t * m_in(qb, fsz); \
+    vec4 G = wa + wb > 0.0 ? (wa * ga + wb * gb) / (wa + wb) : mix(ga, gb, t); \
+    @if (neigh > 0) \
+        G = mix(gs / ws, G, agree); \
+    /* fallback */ \
+    vec4 F = mix(za, zb, t); \
+    vec2 V = vec2(0.0); \
+    float still = 0.0, wv = 0.0; \
+    float ef = abs(m_luma(za) - m_luma(zb)); \
+    @if (fallback == 1) { \
+    V = v; \
+    still = ev.y; \
+    wv = 1.0; \
+    @} \
+    @if (fallback == 2 || fallback == 3) { \
+    vec2 bp = P / vec2(${const float: bgw}, ${const float: bgh}); \
+    V = 0.5 * (textureLod($blkf, bp, 0.0).xy - textureLod($blkb, bp, 0.0).xy); \
+    still = m_eval(c0, V, t).y; \
+    wv = 1.0; \
+    @} \
+    @if (fallback >= 1 && fallback <= 3) { \
+    vec4 fa = m_sa((c0 - t * V + 0.5) * isz), fb = m_sb((c0 + (1.0 - t) * V + 0.5) * isz); \
+    float ev1 = abs(m_luma(fa) - m_luma(fb)); \
+    @if (fallback == 3) \
+        wv = exp(-max(ev1 * ev1 - ef * ef, 0.0) * ${float: inv_sigma}); \
+    still *= 1.0 - exp(-4.0 * dot(V, V)); \
+    wv *= 1.0 - still; \
+    F = mix(F, mix(fa, fb, t), wv); \
+    ef = mix(ef, ev1, wv); \
+    @} \
+    @if (fallback >= 4 && neigh > 0) \
+        F = fs / fw; \
+    @if (veto) { \
+    float eg = max(abs(m_luma(ga) - m_luma(gb)) - ef, 0.0); \
+    Q *= exp(-eg * eg * ${float: inv_veto}); \
+    @} \
+    color = mix(F, G, Q); \
+    @if (show == 1) \
+        color = vec4(vec3(Q), 1.0); \
+    @if (show == 2) \
+        color = G; \
+    @if (show == 3) \
+        color = F; \
+    @if (show == 4) \
+        color = vec4(still, 0.5 + V / 64.0, 1.0); \
+    @if (show == 5) { \
+    float differ = 1.0 - exp(-dot(vf - vb, vf - vb)); \
+    color = mix(vec4(vec3(0.3 * m_luma(G)), 1.0), \
+                vec4(1.0 - side, 0.0, side, 1.0), differ); \
+    @} \
+    }
+    // clang-format on
+    return true;
+}
+
 bool pl_shader_frame_interp(pl_shader sh,
                             const struct pl_frame_interp_input *input,
                             const struct pl_frame_interp_params *params)
@@ -3349,6 +3904,7 @@ bool pl_shader_frame_interp(pl_shader sh,
         me_global = params->local.global > 0.0f;
         break;
     case PL_FRAME_INTERP_GATHER:
+    case PL_FRAME_INTERP_MIX:
         me_dir = PL_MOTION_BOTH;
         break;
     case PL_FRAME_INTERP_ALGO_COUNT:
@@ -3358,7 +3914,9 @@ bool pl_shader_frame_interp(pl_shader sh,
         return false;
     }
 
-    motion_b_request = params->algo == PL_FRAME_INTERP_GATHER;
+    motion_b_request = params->algo == PL_FRAME_INTERP_GATHER ? 1 :
+                       params->algo == PL_FRAME_INTERP_MIX ? 2 : 0;
+    motion_mix_request = params->mix;
 
     // A no-op if the motion between this pair of frames is already known.
     bool ok = pl_motion_estimate(pl_motion_estimate_input(
@@ -3387,6 +3945,8 @@ bool pl_shader_frame_interp(pl_shader sh,
         return frame_interp_local(sh, input, params, &out_color);
     case PL_FRAME_INTERP_GATHER:
         return frame_interp_gather(sh, input, &out_color);
+    case PL_FRAME_INTERP_MIX:
+        return frame_interp_mix(sh, input, &params->mix, &out_color);
     case PL_FRAME_INTERP_ALGO_COUNT:
         break;
     }

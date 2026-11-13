@@ -174,6 +174,16 @@ PL_API pl_tex pl_motion_get_flow(pl_shader_obj state,
 PL_API bool pl_motion_debug_gather_set(pl_shader_obj state, int dir,
                                        const void *flow, const uint8_t *front);
 
+// EXPERIMENT: replace what `PL_FRAME_INTERP_MIX` reads for `dir` (0 fwd,
+// 1 bwd) after an estimation: the vectors (rg16f, one per pixel) and the
+// quality (two u8 per pixel: quality, static flag).
+PL_API bool pl_motion_debug_mix_set(pl_shader_obj state, int dir,
+                                    const void *flow, const uint8_t *quality);
+
+// EXPERIMENT: the quality field of `dir` as `PL_FRAME_INTERP_MIX` reads it
+// (rg8: quality, static flag), or with `raw`, before it was cleaned.
+PL_API pl_tex pl_motion_debug_mix_get(pl_shader_obj state, int dir, bool raw);
+
 // Returns the buffer holding the global motion vector in the direction `dir`
 // or NULL if no `pl_motion_estimate` call for the current frame pair set
 // `estimate_global`, if it did not compute `dir`, or if no estimation has
@@ -246,6 +256,11 @@ enum pl_frame_interp_algo {
     // counts in the frames whose content at its samples moves with it.
     PL_FRAME_INTERP_GATHER,
 
+    // EXPERIMENTAL: every pixel is a mix of both frames compensated by its
+    // own vector, and a fallback blend (plain frame mixing by default), by a
+    // per pixel estimate of how far the vector can be trusted.
+    PL_FRAME_INTERP_MIX,
+
     PL_FRAME_INTERP_ALGO_COUNT,
 };
 
@@ -298,6 +313,107 @@ struct pl_frame_interp_local_params {
     .conf_hi = 0.2f, .global = 0.02f, .sigma = 0.2f, .sharp = 1.0f,            \
     .fallback = 0.05f,
 
+// EXPERIMENTAL: tunables of `PL_FRAME_INTERP_MIX`. Subject to change or
+// removal without notice.
+//
+//   out = mix(blend along V, both frames sampled along the pixel's vector, Q)
+//
+// The vector quality Q is estimated per pixel of both flow fields, once per
+// frame pair, as a product of terms that each only lower it.
+struct pl_frame_interp_mix_params {
+    // --- Vector quality, per frame pair
+
+    // How far a pixel found to be hidden in the other frame loses its
+    // quality, 0 to 1.
+    float q_vis;
+
+    // Mismatch between the pixel's 3x3 window and where its vector leads,
+    // relative to the window's texture, from which the quality starts to
+    // fall, and at which it is gone. `q_cost_hi` = 0 disables this.
+    float q_cost_lo, q_cost_hi;
+
+    // Texture, as a standard deviation in 8 bit code values, added to that
+    // of the window: the level of noise below which a mismatch means nothing.
+    float q_cost_flat;
+
+    // Distance, in pixels, of a vector from the median of the 3x3 vectors
+    // around it at which its quality falls to 1/e. 0 disables this.
+    float q_outlier;
+
+    // Quality left to a vector that leaves the frame, which can be told from
+    // those around it but not be verified, 0 to 1.
+    float q_border;
+
+    // Cleaning of the quality: 1 = 3x3 median (drops isolated pixels), 2 =
+    // followed by a 3x3 minimum.
+    int clean;
+
+    // Standard deviation, in pixels, of the gaussian blur of the quality.
+    float soften;
+
+    // Replace the vectors by the 3x3 median.
+    bool vec_median;
+
+    // Give hidden pixels the vector of the nearest visible pixels.
+    bool fill;
+
+    // Mean absolute difference between both frames around a pixel, in 8 bit
+    // code values, below which it counts as static for `static_test` = 2.
+    float static_thresh;
+
+    // --- Synthesis, per output frame
+
+    // What to output: 0 = the result, 1 = Q, 2 = the compensated sample, 3 =
+    // the fallback blend, 4 = the static veto (red) and V (green/blue), 5 =
+    // the field the vector was taken from (red forward, blue backward).
+    int show;
+
+    // Which field's vector a pixel uses: 0 = the forward one, 1 = that of
+    // the nearer frame, 2 = the one of higher quality.
+    int pick;
+
+    // Vector difference, in pixels, between a vector and those of the pixels
+    // it samples in either frame at which Q falls to 1/e. 0 disables this.
+    float consist;
+
+    // The motion V the fallback blends along: 0 = none (plain frame mixing),
+    // 1 = the pixel's own vector, 2 = the smooth block motion around it, 3 =
+    // per pixel none or 2, by how well the frames then agree, 4 = instead of
+    // one V, the vectors `neigh` adds, weighed by how well the frames agree
+    // along each, 5 = like 4, with none and 2 among them.
+    int fallback;
+
+    // A moving V yields to plain frame mixing where it samples a static
+    // pixel: 0 = never, 1 = a pixel whose vector is zero, 2 = a pixel that
+    // is the same in both frames.
+    int static_test;
+
+    // Tolerated mismatch between the two samples of the fallback candidates,
+    // for `fallback` = 3, as a difference in the square root of their luma.
+    float sigma;
+
+    // Difference, in the square root of the luma, between the two
+    // compensated samples at which Q falls to 1/e, beyond the difference
+    // between the two samples of the fallback. 0 disables this.
+    float veto;
+
+    // Also consider the vectors of both fields this many pixels to the left,
+    // right, above and below: all are weighed by their quality and by how
+    // well the two frames agree along them (`sigma`), and sampled once along
+    // their mean as far as they agree. 0 disables this.
+    float neigh;
+
+    // Sample the compensated frames with a bicubic filter.
+    bool sharp;
+};
+
+#define PL_FRAME_INTERP_MIX_DEFAULTS                                           \
+    .q_vis = 1.0f, .q_cost_lo = 0.35f, .q_cost_hi = 0.8f, .q_outlier = 2.0f,   \
+    .q_cost_flat = 6.0f, .q_border = 1.0f, .fill = true,                       \
+    .clean = 1, .soften = 1.5f, .static_thresh = 1.0f, .pick = 2,              \
+    .consist = 2.0f, .fallback = 5, .static_test = 1, .sigma = 0.2f,           \
+    .neigh = 4.0f, .sharp = true,
+
 // Tunable parameters. Kept separate from the per-call inputs so that callers
 // can reuse unchanging configurations.
 struct pl_frame_interp_params {
@@ -309,12 +425,16 @@ struct pl_frame_interp_params {
 
     // Parameters of `PL_FRAME_INTERP_LOCAL_MOTION`.
     struct pl_frame_interp_local_params local;
+
+    // Parameters of `PL_FRAME_INTERP_MIX`.
+    struct pl_frame_interp_mix_params mix;
 };
 
 #define PL_FRAME_INTERP_DEFAULTS                                               \
     .algo = PL_FRAME_INTERP_GLOBAL_MOTION,                                     \
     .motion = {PL_MOTION_ESTIMATE_DEFAULTS},                                   \
-    .local = {PL_FRAME_INTERP_LOCAL_DEFAULTS},
+    .local = {PL_FRAME_INTERP_LOCAL_DEFAULTS},                                 \
+    .mix = {PL_FRAME_INTERP_MIX_DEFAULTS},
 
 #define pl_frame_interp_params(...)                                            \
     (&(struct pl_frame_interp_params) {PL_FRAME_INTERP_DEFAULTS __VA_ARGS__})
