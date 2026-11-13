@@ -167,16 +167,6 @@ PL_API void pl_motion_reset(pl_shader_obj state);
 // vector matches badly.
 PL_API pl_tex pl_motion_get_flow(pl_shader_obj state,
                                  enum pl_motion_direction dir);
-// EXPERIMENT: level 0 search output before smoothing, dir 0 fwd / 1 bwd.
-PL_API pl_tex pl_motion_debug_raw(pl_shader_obj state, int dir);
-PL_API pl_tex pl_motion_debug_fine(pl_shader_obj state, int dir);
-
-PL_API pl_tex pl_motion_debug_get_sel(pl_shader_obj state, int dir);
-PL_API bool pl_motion_debug_redo_b(pl_shader_obj state, pl_dispatch dp);
-// EXPERIMENT: overwrite the flow of `dir` (rgba16f, size of the flow texture).
-PL_API bool pl_motion_debug_set_flow(pl_shader_obj state,
-                                     enum pl_motion_direction dir,
-                                     const void *data);
 
 // Returns the buffer holding the global motion vector in the direction `dir`
 // or NULL if no `pl_motion_estimate` call for the current frame pair set
@@ -245,9 +235,10 @@ enum pl_frame_interp_algo {
     // weighing the vectors by how well the two frames then agree, and falling
     // back to plain frame mixing where no motion is known.
     PL_FRAME_INTERP_LOCAL_MOTION,
-    // EXPERIMENTAL: per pixel vectors with occlusion, splatted to the
-    // intermediate frame's time, then one sample of each frame per pixel.
-    PL_FRAME_INTERP_SPLAT,
+    // EXPERIMENTAL: like `PL_FRAME_INTERP_LOCAL_MOTION`, on per pixel
+    // vectors with occlusion and layer order: each candidate vector only
+    // counts in the frames whose content at its samples moves with it.
+    PL_FRAME_INTERP_GATHER,
 
     PL_FRAME_INTERP_ALGO_COUNT,
 };

@@ -430,7 +430,7 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 [PL_FRAME_INTERP_GLOBAL_MOTION] = "Global motion",
                 [PL_FRAME_INTERP_VISUALIZE]     = "Visualize motion vectors",
                 [PL_FRAME_INTERP_LOCAL_MOTION]  = "Local motion (experimental)",
-                [PL_FRAME_INTERP_SPLAT]         = "Splat (experimental)",
+                [PL_FRAME_INTERP_GATHER]        = "Gather (experimental)",
             };
 
             nk_label(nk, "Algorithm", NK_TEXT_LEFT);
