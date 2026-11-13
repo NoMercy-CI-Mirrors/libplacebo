@@ -3097,6 +3097,78 @@ static bool frame_interp_local(pl_shader sh,
     return true;
 }
 
+// Binds both frames of `input` for `frame_interp_gather`: per frame, the texture, its position and texel size,
+// the conversion to `out_color` (`conv`, a function) and a bicubic sampler
+// including that conversion (`cubic`).
+static bool interp_bind_frames(pl_shader sh,
+                               const struct pl_frame_interp_input *input,
+                               const struct pl_color_space *out_color,
+                               const char *desc, ident_t conv[2], ident_t tex[2],
+                               ident_t pos[2], ident_t pt[2], ident_t cubic[2])
+{
+    const struct pl_tex_params *tpars = &input->a.tex->params;
+    const struct pl_motion_estimate_frame *frames[2] = { &input->a, &input->b };
+    for (int i = 0; i < 2; i++) {
+        pl_shader sub = pl_dispatch_begin_ex(input->dispatch, true);
+        if (sub->prefix == sh->prefix) {
+            // The first unique identifier may coincide with `sh`'s, which
+            // `sh_subpass` rejects.
+            pl_dispatch_abort(input->dispatch, &sub);
+            sub = pl_dispatch_begin_ex(input->dispatch, true);
+        }
+        sh_require(sub, PL_SHADER_SIG_COLOR, 0, 0);
+        struct pl_color_repr repr = frames[i]->repr;
+        struct pl_color_space csp = frames[i]->color;
+        pl_color_space_infer(&csp);
+        if (!pl_color_space_equal(&csp, out_color)) {
+            pl_shader_set_alpha(sub, &repr, PL_ALPHA_INDEPENDENT);
+            pl_shader_color_map_ex(sub, NULL, pl_color_map_args(csp, *out_color));
+        }
+        pl_shader_set_alpha(sub, &repr, PL_ALPHA_PREMULTIPLIED);
+        conv[i] = sh_subpass(sh, sub);
+        pl_dispatch_abort(input->dispatch, &sub);
+        if (!conv[i])
+            return false;
+    }
+    if (!sh_require(sh, PL_SHADER_SIG_NONE, tpars->w, tpars->h))
+        return false;
+    sh_describe(sh, desc);
+    for (int i = 0; i < 2; i++) {
+        tex[i] = sh_bind(sh, frames[i]->tex, PL_TEX_ADDRESS_CLAMP, PL_TEX_SAMPLE_LINEAR,
+                         "frame", NULL, &pos[i], &pt[i]);
+        if (!tex[i])
+            return false;
+        cubic[i] = sh_fresh(sh, "cubic");
+        // clang-format off
+#pragma GLSLH /* frame_interp_gather */                                         \
+    /* Catmull-Rom, the inner 2x2 taps folded into one bilinear fetch and the */\
+    /* corners dropped */                                                       \
+    vec4 ${cubic[i]}(vec2 p) {                                                  \
+        vec2 pt = ${pt[i]};                                                     \
+        vec2 c  = floor(p / pt - 0.5) + 0.5;                                    \
+        vec2 f  = p / pt - c;                                                   \
+        vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));                             \
+        vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);                               \
+        vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));                              \
+        vec2 w3 = f * f * (-0.5 + 0.5 * f);                                     \
+        vec2 w12 = w1 + w2;                                                     \
+        vec2 p0  = (c - 1.0) * pt;                                              \
+        vec2 p12 = (c + w2 / w12) * pt;                                         \
+        vec2 p3  = (c + 2.0) * pt;                                              \
+        float wsum = w12.x * w0.y + (w0.x + w12.x + w3.x) * w12.y + w12.x * w3.y;\
+        return ${conv[i]}(                                                      \
+            (textureLod(${tex[i]}, vec2(p12.x, p0.y),  0.0) * w12.x * w0.y +    \
+            (textureLod(${tex[i]}, vec2(p0.x,  p12.y), 0.0) * w0.x  +           \
+             textureLod(${tex[i]}, vec2(p12.x, p12.y), 0.0) * w12.x +           \
+             textureLod(${tex[i]}, vec2(p3.x,  p12.y), 0.0) * w3.x) * w12.y +   \
+             textureLod(${tex[i]}, vec2(p12.x, p3.y),  0.0) * w12.x * w3.y) / wsum);\
+    }
+        // clang-format on
+    }
+
+    return true;
+}
+
 // Every output pixel is a blend of both frames compensated by 8 candidate
 // vectors: those of the per pixel fields of both directions at the four points of
 // a lattice (pitch MOTION_GATHER_PITCH) around the pixel, as in
@@ -3145,67 +3217,10 @@ static bool frame_interp_gather(pl_shader sh,
         return false;
     }
     const float t = PL_CLAMP(input->t, 0.0f, 1.0f);
-    const struct pl_tex_params *tpars = &input->a.tex->params;
-    const struct pl_motion_estimate_frame *frames[2] = { &input->a, &input->b };
-    ident_t conv[2];
-    for (int i = 0; i < 2; i++) {
-        pl_shader sub = pl_dispatch_begin_ex(input->dispatch, true);
-        if (sub->prefix == sh->prefix) {
-            // The first unique identifier may coincide with `sh`'s, which
-            // `sh_subpass` rejects.
-            pl_dispatch_abort(input->dispatch, &sub);
-            sub = pl_dispatch_begin_ex(input->dispatch, true);
-        }
-        sh_require(sub, PL_SHADER_SIG_COLOR, 0, 0);
-        struct pl_color_repr repr = frames[i]->repr;
-        struct pl_color_space csp = frames[i]->color;
-        pl_color_space_infer(&csp);
-        if (!pl_color_space_equal(&csp, out_color)) {
-            pl_shader_set_alpha(sub, &repr, PL_ALPHA_INDEPENDENT);
-            pl_shader_color_map_ex(sub, NULL, pl_color_map_args(csp, *out_color));
-        }
-        pl_shader_set_alpha(sub, &repr, PL_ALPHA_PREMULTIPLIED);
-        conv[i] = sh_subpass(sh, sub);
-        pl_dispatch_abort(input->dispatch, &sub);
-        if (!conv[i])
-            return false;
-    }
-    if (!sh_require(sh, PL_SHADER_SIG_NONE, tpars->w, tpars->h))
+    ident_t conv[2], tex[2], pos[2], pt[2], cubic[2];
+    if (!interp_bind_frames(sh, input, out_color, "frame interpolation (gather)",
+                            conv, tex, pos, pt, cubic))
         return false;
-    sh_describe(sh, "frame interpolation (gather)");
-    ident_t tex[2], pos[2], pt[2], cubic[2];
-    for (int i = 0; i < 2; i++) {
-        tex[i] = sh_bind(sh, frames[i]->tex, PL_TEX_ADDRESS_CLAMP, PL_TEX_SAMPLE_LINEAR,
-                         "frame", NULL, &pos[i], &pt[i]);
-        if (!tex[i])
-            return false;
-        cubic[i] = sh_fresh(sh, "cubic");
-        // clang-format off
-#pragma GLSLH /* frame_interp_gather */                                         \
-    /* Catmull-Rom, the inner 2x2 taps folded into one bilinear fetch and the */\
-    /* corners dropped */                                                       \
-    vec4 ${cubic[i]}(vec2 p) {                                                  \
-        vec2 pt = ${pt[i]};                                                     \
-        vec2 c  = floor(p / pt - 0.5) + 0.5;                                    \
-        vec2 f  = p / pt - c;                                                   \
-        vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));                             \
-        vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);                               \
-        vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));                              \
-        vec2 w3 = f * f * (-0.5 + 0.5 * f);                                     \
-        vec2 w12 = w1 + w2;                                                     \
-        vec2 p0  = (c - 1.0) * pt;                                              \
-        vec2 p12 = (c + w2 / w12) * pt;                                         \
-        vec2 p3  = (c + 2.0) * pt;                                              \
-        float wsum = w12.x * w0.y + (w0.x + w12.x + w3.x) * w12.y + w12.x * w3.y;\
-        return ${conv[i]}(                                                      \
-            (textureLod(${tex[i]}, vec2(p12.x, p0.y),  0.0) * w12.x * w0.y +    \
-            (textureLod(${tex[i]}, vec2(p0.x,  p12.y), 0.0) * w0.x  +           \
-             textureLod(${tex[i]}, vec2(p12.x, p12.y), 0.0) * w12.x +           \
-             textureLod(${tex[i]}, vec2(p3.x,  p12.y), 0.0) * w3.x) * w12.y +   \
-             textureLod(${tex[i]}, vec2(p12.x, p3.y),  0.0) * w12.x * w3.y) / wsum);\
-    }
-        // clang-format on
-    }
 
     pl_tex *front = obj->gather.front;
     pl_tex qual = obj->gather.quality;
