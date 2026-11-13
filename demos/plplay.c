@@ -474,10 +474,17 @@ static bool render_loop(struct plplay *p)
     window_poll(p->win, false);
 
     double pts_target = 0.0, prev_pts = 0.0;
+    double pause_time = 0.0; // total time spent paused
+    bool space_prev = false;
 
     while (!p->win->window_lost) {
         if (window_get_key(p->win, KEY_ESC))
             break;
+
+        const bool space = window_get_key(p->win, KEY_SPACE);
+        if (space && !space_prev)
+            p->paused = !p->paused;
+        space_prev = space;
 
         if (p->toggle_fullscreen)
             window_toggle_fullscreen(p->win, !window_is_fullscreen(p->win));
@@ -497,7 +504,15 @@ static bool render_loop(struct plplay *p)
 
         struct pl_queue_params *qparams = &params;
         qparams->timeout = 0; // non-blocking update
-        qparams->pts = fmax(pts_target, pl_clock_diff(ts_pre_update, ts_start));
+        double pts_now = pl_clock_diff(ts_pre_update, ts_start) - pause_time;
+        if (p->paused) {
+            const double hold = prev_pts + p->pause_step;
+            pause_time += pts_now - hold;
+            pts_now = hold;
+            pts_target = 0.0;
+        }
+        p->pause_step = 0.0;
+        qparams->pts = fmax(pts_target, pts_now);
         p->stats.current_pts = qparams->pts;
         if (qparams->pts != prev_pts)
             log_time(&p->stats.pts_interval, qparams->pts - prev_pts);
@@ -533,12 +548,12 @@ retry:
         if (pts_target) {
             pl_gpu_flush(p->win->gpu);
             pl_clock_t ts_wait = pl_clock_now();
-            double pts_now = pl_clock_diff(ts_wait, ts_start);
-            if (pts_target >= pts_now) {
-                log_time(&p->stats.sleep, pts_target - pts_now);
-                pl_thread_sleep(pts_target - pts_now);
+            double pts_wait = pl_clock_diff(ts_wait, ts_start) - pause_time;
+            if (pts_target >= pts_wait) {
+                log_time(&p->stats.sleep, pts_target - pts_wait);
+                pl_thread_sleep(pts_target - pts_wait);
             } else {
-                double missed_ms = 1e3 * (pts_now - pts_target);
+                double missed_ms = 1e3 * (pts_wait - pts_target);
                 fprintf(stderr, "Missed PTS target %.3f (%.3f ms in the past)\n",
                         pts_target, missed_ms);
                 p->stats.missed++;
@@ -582,6 +597,8 @@ retry:
 
         if (p->fps_override)
             pts_target = fmax(pts_target, qparams->pts + 1.0 / p->fps);
+        if (p->paused)
+            pts_target = 0.0;
     }
 
     return true;

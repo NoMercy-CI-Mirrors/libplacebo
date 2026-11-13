@@ -223,6 +223,18 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
 
     if (nk_begin(nk, "Settings", nk_rect(100, 100, 600, 600), win_flags)) {
 
+        // Pausing holds the presentation time; the frame is still rendered
+        // every vsync, so changes to the settings show immediately
+        nk_layout_row_dynamic(nk, 24, 3);
+        nk_checkbox_label(nk, "Pause (Space)", &p->paused);
+        const double out_frame = 1.0 / (p->fps_override && p->fps > 0 ? p->fps : 60.0);
+        if (nk_button_label(nk, "Step output frame") && p->paused)
+            p->pause_step = out_frame;
+        if (nk_button_label(nk, "Step 1/24 s") && p->paused)
+            p->pause_step = 1.0 / 24.0;
+        nk_layout_row_dynamic(nk, 24, 1);
+        nk_labelf(nk, NK_TEXT_LEFT, "Time: %.4f s", p->stats.current_pts);
+
         if (nk_tree_push(nk, NK_TREE_NODE, "Window settings", NK_MAXIMIZED)) {
             nk_layout_row_dynamic(nk, 24, 2);
 

@@ -36,6 +36,7 @@ enum button {
 
 enum key {
     KEY_ESC,
+    KEY_SPACE,
 };
 
 void window_get_cursor(const struct window *win, int *x, int *y);

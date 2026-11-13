@@ -60,6 +60,12 @@ struct plplay {
     bool fps_override;
     float fps;
 
+    // Holds the presentation time, so that the same output frame is rendered
+    // over and over with the current settings. `pause_step` is a number of
+    // seconds to advance by once, while paused.
+    bool paused;
+    double pause_step;
+
     // ICC profile
     pl_icc_object icc;
     char *icc_name;

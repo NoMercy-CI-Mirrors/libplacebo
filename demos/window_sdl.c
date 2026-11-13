@@ -311,6 +311,7 @@ static bool sdl_get_key(const struct window *window, enum key key)
 {
     static const size_t key_map[] = {
         [KEY_ESC] = SDL_SCANCODE_ESCAPE,
+        [KEY_SPACE] = SDL_SCANCODE_SPACE,
     };
 
     return SDL_GetKeyboardState(NULL)[key_map[key]];
