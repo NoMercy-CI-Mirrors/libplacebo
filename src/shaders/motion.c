@@ -496,16 +496,21 @@ static bool pyramid_recreate(pl_gpu gpu, void *alloc, tex_pyramid_t *pyramid,
 // Format for motion vector fields, holding `vec3(mv.x, mv.y, confidence)`,
 // with an empty fourth element for padding. Prefer 16 bit floats but fall back
 // to 32 bits.
-static pl_fmt flow_fmt(pl_gpu gpu)
+static pl_fmt flow_fmt_n(pl_gpu gpu, int comps)
 {
     static const enum pl_fmt_caps caps = PL_FMT_CAP_STORABLE |
                                          PL_FMT_CAP_LINEAR;
 
-    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 0, caps);
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, comps, 16, 0, caps);
     if (fmt)
         return fmt;
 
-    return pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 0, caps);
+    return pl_find_fmt(gpu, PL_FMT_FLOAT, comps, 32, 0, caps);
+}
+
+static pl_fmt flow_fmt(pl_gpu gpu)
+{
+    return flow_fmt_n(gpu, 4);
 }
 
 // Similar to `pyramid_recreate`, except does not invalidate the contents of
@@ -2390,7 +2395,8 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
     obj->grid_h = PL_DIV_UP(h, params->block_size);
 
     pl_fmt mv_fmt = flow_fmt(gpu);
-    if (!mv_fmt) {
+    pl_fmt blk_fmt = flow_fmt_n(gpu, 2);
+    if (!mv_fmt || !blk_fmt) {
         PL_ERR(gpu, "pl_motion_estimate: no storable, linearly filterable "
                     "two component float format available!");
         goto error;
@@ -2401,14 +2407,14 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
     // in the `obj->flow.fwd` and `obj->flow.bwd`.
     if (input->direction & PL_MOTION_FORWARD) {
         if (!flow_pyramid_recreate(gpu, obj, &obj->flow.fwd, w, h, levels,
-                                   params->block_size, mv_fmt) ||
+                                   params->block_size, blk_fmt) ||
             !dense_flow_recreate(gpu, &obj->flow.dense_fwd, w, h, mv_fmt))
             goto error;
     }
 
     if (input->direction & PL_MOTION_BACKWARD) {
         if (!flow_pyramid_recreate(gpu, obj, &obj->flow.bwd, w, h, levels,
-                                   params->block_size, mv_fmt) ||
+                                   params->block_size, blk_fmt) ||
             !dense_flow_recreate(gpu, &obj->flow.dense_bwd, w, h, mv_fmt))
             goto error;
     }
@@ -2420,11 +2426,11 @@ bool pl_motion_estimate(const struct pl_motion_estimate_input *input,
     }
 
     if (!flow_pyramid_recreate(gpu, obj, &obj->scratch.raw, w, h, levels,
-                               params->block_size, mv_fmt))
+                               params->block_size, blk_fmt))
         goto error;
 
     if (!flow_pyramid_recreate(gpu, obj, &obj->scratch.filtered, w, h, levels,
-                               params->block_size, mv_fmt))
+                               params->block_size, blk_fmt))
         goto error;
 
     // Upon cold start or after reset, build the image pyramid for frame `a`,
