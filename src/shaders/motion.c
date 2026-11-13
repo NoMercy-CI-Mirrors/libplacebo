@@ -1507,7 +1507,7 @@ error:
 // and the mean SSD of all candidates, relative to the texture energy of the
 // window. Including the other candidates makes this larger at motion
 // boundaries, where occlusions happen. Vectors that lead out of the frame get
-// no confidence at all.
+// no confidence at all. With `plain`, it is left at 0 instead.
 static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
                                pl_tex ref, pl_tex tgt, pl_tex flow, pl_tex out,
                                bool plain)
@@ -1621,7 +1621,8 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
             raw += s_diff[sbase + (local.y + j / ${const int: win}) * ${const int: tile}\
                           + local.x + j % ${const int: win}];                   \
         }                                                                       \
-        mean_ssd += raw / 9.0;                                                  \
+        @if (!plain)                                                            \
+            mean_ssd += raw / 9.0;                                              \
         float ssd = k == 0 ? raw : raw + ${float: margin};                      \
         if (k == 0 || ssd < best_ssd) {                                         \
             best = cand[k];                                                     \
@@ -1630,11 +1631,14 @@ static bool motion_refine_pass(pl_gpu gpu, pl_dispatch dispatch, int bs,
         }                                                                       \
     }                                                                           \
                                                                                 \
+    float conf = 0.0;                                                           \
+    @if (!plain) {                                                              \
     float mismatch = sqrt(best_raw * mean_ssd) / (energy + ${float: flat});     \
-    float conf = 1.0 / (1.0 + mismatch / ${float: MOTION_REFINE_OCCLUSION});    \
+    conf = 1.0 / (1.0 + mismatch / ${float: MOTION_REFINE_OCCLUSION});          \
     vec2 to = vec2(pos) + vec2(0.5) + best.xy;                                  \
     if (any(lessThan(to, vec2(0.0))) || any(greaterThan(to, vec2(size))))      \
         conf = 0.0;                                                             \
+    @}                                                                          \
                                                                                 \
     if (all(lessThan(sub, ivec2(${const int: bs}))) && all(lessThan(pos, size)))\
         imageStore($dst, pos, vec4(best.xy, conf, 0.0));
