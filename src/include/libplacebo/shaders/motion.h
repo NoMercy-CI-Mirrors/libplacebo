@@ -316,7 +316,7 @@ struct pl_frame_interp_local_params {
 // EXPERIMENTAL: tunables of `PL_FRAME_INTERP_MIX`. Subject to change or
 // removal without notice.
 //
-//   out = mix(blend along V, both frames sampled along the pixel's vector, Q)
+//   out = mix(fallback, both frames sampled along the pixel's vector, Q)
 //
 // The vector quality Q is estimated per pixel of both flow fields, once per
 // frame pair, as a product of terms that each only lower it.
@@ -359,70 +359,43 @@ struct pl_frame_interp_mix_params {
 
     // --- Synthesis, per output frame
 
-    // What to output: 0 = the result, 1 = Q, 2 = the compensated sample, 3 =
-    // the fallback blend, 4 = V (red/green), 5 =
-    // the field the vector was taken from (red forward, blue backward), 6 =
-    // the share of the vector `stat_cand` in the output through the fallback
-    // (red), through the compensated sample (green), and in the fallback
-    // (blue), 7 = the sample of the vector `stat_cand`, faded to grey by its
-    // score in the fallback, 8 = that sample with the score in alpha, for
-    // measuring.
-    int show;
+    // Weight of plain frame mixing in the fallback, 0 to 1. At 0 the fallback
+    // is the mix of both frames sampled along each of the vectors around the
+    // pixel, which follows the motion but can put content where it does not
+    // belong; at 1 it is the two frames as they are, which blurs or ghosts
+    // but cannot.
+    float plain;
 
-    // For `show` = 6, with `neigh`: 0/1 = forward/backward field at the
-    // pixel, 2-9 = those to the right, left, below and above, anything
-    // higher = plain frame mixing. For `show` = 7 and 8 also -1 = the
-    // fallback, -2 = the compensated sample.
-    int stat_cand;
-
-    // With `neigh`: bit mask of the vectors (numbered as for `stat_cand`) to
-    // consider. 0 = all.
-    int cand_mask;
-
-    // Which field's vector a pixel uses: 0 = the forward one, 1 = that of
-    // the nearer frame, 2 = the one of higher quality.
-    int pick;
-
-    // Vector difference, in pixels, between a vector and those of the pixels
-    // it samples in either frame at which Q falls to 1/e. 0 disables this.
-    float consist;
-
-    // The motion V the fallback blends along: 0 = none (plain frame mixing),
-    // 1 = the pixel's own vector, 2 = the smooth block motion around it, 3 =
-    // per pixel none or 2, by how well the frames then agree, 4 = instead of
-    // one V, the vectors `neigh` adds, weighed by how well the frames agree
-    // along each.
-    int fallback;
-
-    // Tolerated mismatch between the two samples of the fallback candidates,
-    // for `fallback` = 3, as a difference in the square root of their luma.
-    float sigma;
-
-    // For `fallback` = 4: weight of plain frame mixing next to the vectors,
-    // each of which weighs up to 1. Where the frames agree along none of
-    // them, this is what remains.
-    float giveup;
-
-    // Difference, in the square root of the luma, between the two
-    // compensated samples at which Q falls to 1/e, beyond the difference
-    // between the two samples of the fallback. 0 disables this.
-    float veto;
-
-    // Also consider the vectors of both fields this many pixels to the left,
-    // right, above and below: all are weighed by their quality and by how
-    // well the two frames agree along them (`sigma`), and sampled once along
-    // their mean as far as they agree. 0 disables this.
+    // Besides the vectors of both fields at the pixel, use those this many
+    // pixels to its left, right, above and below. 0 disables this.
     float neigh;
 
     // Sample the compensated frames with a bicubic filter.
     bool sharp;
+
+    // --- Debugging
+
+    // What to output: 0 = the result, 1 = Q, 2 = the compensated sample, 3 =
+    // the fallback, 4 = the share of the vector `stat_cand` in the output
+    // through the fallback (red), through the compensated sample (green),
+    // and in the fallback (blue), 5 = the sample of the vector `stat_cand`,
+    // 6 = that sample with 1 - Q in alpha, for measuring.
+    int show;
+
+    // 0/1 = forward/backward field at the pixel, 2-9 = those to the right,
+    // left, below and above, anything higher = plain frame mixing. For
+    // `show` = 5 and 6 also -1 = the fallback, -2 = the compensated sample.
+    int stat_cand;
+
+    // Bit mask of the vectors (numbered as for `stat_cand`) to consider. 0 =
+    // all.
+    int cand_mask;
 };
 
 #define PL_FRAME_INTERP_MIX_DEFAULTS                                           \
     .q_vis = 1.0f, .q_cost_lo = 0.35f, .q_cost_hi = 0.8f, .q_outlier = 2.0f,   \
-    .q_cost_flat = 6.0f, .q_border = 1.0f, .fill = true,                       \
-    .clean = 1, .soften = 1.5f, .pick = 2, .consist = 2.0f, .fallback = 4,     \
-    .sigma = 0.2f, .giveup = 2.0f, .neigh = 4.0f, .sharp = true,
+    .q_cost_flat = 6.0f, .q_border = 1.0f, .fill = true, .clean = 1,           \
+    .soften = 1.5f, .plain = 0.2f, .neigh = 4.0f, .sharp = true,
 
 // Tunable parameters. Kept separate from the per-call inputs so that callers
 // can reuse unchanging configurations.

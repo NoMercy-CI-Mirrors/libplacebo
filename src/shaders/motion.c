@@ -3641,16 +3641,19 @@ static bool frame_interp_gather(pl_shader sh,
     return true;
 }
 
-// out = mix(F, G, Q): G is both frames sampled along the pixel's own vector,
-// read from the per pixel fields at the pixel itself, F a fallback blend
-// (plain frame mixing unless `mp->fallback`), and Q the quality of the vector
-// at the pixels it samples (see `motion_b_post_mix`). With Q = 0 this is F, so
-// it can only be worse than F where Q is too high.
+// out = mix(F, G, Q), for every pixel, from a handful of vectors: those the
+// two per pixel fields hold at the pixel itself and, with `mp->neigh`, at four
+// pixels around it. The fields hold the vector of what is at a pixel in their
+// own frame, read here at the output pixel, so each vector is only a guess at
+// what moves through it; the quality of a vector is that of the pixels it
+// samples in either frame (see `motion_b_post_mix`).
 //
-// The two fields hold the vector of what is at the pixel in their own frame.
-// Content that moves by less than its length is at the pixel in at least one
-// of the two frames, so one of the two vectors is the right one: the one of
-// higher quality (`mp->pick`).
+// G is the compensated sample: both frames along the mean of the vectors,
+// weighed by their quality, or as far as they disagree, the mix of the samples
+// along each. Q is their mean quality. F is the fallback for where the vectors
+// cannot be trusted: the samples along all of them, mixed regardless of their
+// quality, and (`mp->plain`) plain frame mixing, which blurs or ghosts but
+// cannot put anything where neither frame has it.
 static bool frame_interp_mix(pl_shader sh,
                              const struct pl_frame_interp_input *input,
                              const struct pl_frame_interp_mix_params *mp,
@@ -3676,24 +3679,12 @@ static bool frame_interp_mix(pl_shader sh,
     ident_t bwd = bind_tex(sh, "m_bwd", obj->flow.dense_bwd);
     ident_t qfwd = bind_tex_linear(sh, "m_qfwd", obj->mix.q[0]);
     ident_t qbwd = bind_tex_linear(sh, "m_qbwd", obj->mix.q[1]);
-    const bool consist = mp->consist > 0.0f, veto = mp->veto > 0.0f;
-    const float inv_consist = consist ? 1.0f / PL_SQUARE(mp->consist) : 0.0f;
-    const float inv_veto = veto ? 1.0f / PL_SQUARE(mp->veto) : 0.0f;
-    const float inv_sigma = 1.0f / PL_SQUARE(PL_MAX(mp->sigma, 1e-3f));
-    const int pick = mp->pick, fallback = mp->fallback, show = mp->show;
-    const bool local = fallback == 2 || fallback == 3, sharp = mp->sharp;
-    // The vectors of both fields at the pixel and at 4 pixels around it
-    const int ncand = 10;
-    const int mask = mp->cand_mask & ((1 << ncand) - 1);
+    const bool sharp = mp->sharp;
+    const int show = mp->show;
     const int neigh = PL_CLAMP((int) roundf(mp->neigh), 0, 64);
-    ident_t blkf = NULL_IDENT, blkb = NULL_IDENT;
-    if (local) {
-        blkf = bind_tex_linear(sh, "m_blkf", obj->flow.fwd.elem[0]);
-        blkb = bind_tex_linear(sh, "m_blkb", obj->flow.bwd.elem[0]);
-    }
-    // Size of the block grid in pixels
-    const float bgw = obj->grid_w * obj->params.block_size,
-                bgh = obj->grid_h * obj->params.block_size;
+    const int ncand = neigh > 0 ? 10 : 2;
+    const int mask = mp->cand_mask & ((1 << ncand) - 1);
+    const float plain = PL_CLAMP(mp->plain, 0.0f, 1.0f);
 
     // clang-format off
 #pragma GLSLH /* frame_interp_mix */ \
@@ -3702,28 +3693,6 @@ static bool frame_interp_mix(pl_shader sh,
     float m_in(vec2 p, vec2 sz) { \
         return all(greaterThanEqual(p, vec2(-0.5))) && \
                all(lessThanEqual(p, sz - 0.5)) ? 1.0 : 0.0; \
-    } \
-    float m_luma(vec4 c) { \
-        return sqrt(max(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0)); \
-    } \
-    /* Quality of the vector `v` at the pixel centred on `c` */ \
-    float m_eval(vec2 c, vec2 v, float t) { \
-        ivec2 size = ivec2(${const int: w}, ${const int: h}); \
-        vec2 fsz = vec2(size); \
-        vec2 qa = c - t * v, qb = c + (1.0 - t) * v; \
-        float sa = textureLod($qfwd, (qa + 0.5) / fsz, 0.0).x; \
-        float sb = textureLod($qbwd, (qb + 0.5) / fsz, 0.0).x; \
-        /* a side that is out of the frame does not count */ \
-        float ina = m_in(qa, fsz), inb = m_in(qb, fsz); \
-        float q = min(mix(1.0, sa, ina), mix(1.0, sb, inb)) * max(ina, inb); \
-        @if (consist) { \
-        ivec2 ia = clamp(ivec2(floor(qa + 0.5)), ivec2(0), size - 1); \
-        ivec2 ib = clamp(ivec2(floor(qb + 0.5)), ivec2(0), size - 1); \
-        vec2 fa = texelFetch($fwd, ia, 0).xy, fb = texelFetch($bwd, ib, 0).xy; \
-        vec2 da = fa - v, db = fb + v; \
-        q *= exp(-max(ina * dot(da, da), inb * dot(db, db)) * ${float: inv_consist}); \
-        @} \
-        return q; \
     }
 
 #pragma GLSL /* frame_interp_mix */ \
@@ -3737,33 +3706,9 @@ static bool frame_interp_mix(pl_shader sh,
     vec2 P = pa * fsz; \
     vec2 c0 = P - 0.5; \
     ivec2 ip = clamp(ivec2(floor(P)), ivec2(0), size - 1); \
-    vec2 vf = texelFetch($fwd, ip, 0).xy, vb = -texelFetch($bwd, ip, 0).xy; \
-    vec2 v = vf; \
-    float side = 0.0; \
-    @if (pick == 1) { \
-    if (t > 0.5) { \
-        v = vb; \
-        side = 1.0; \
-    } \
-    @} \
-    float ev = m_eval(c0, v, t); \
-    @if (pick >= 2) { \
-    float eb = m_eval(c0, vb, t); \
-    /* equally good: the nearer frame's */ \
-    if (eb > ev + (t > 0.5 ? -0.02 : 0.02)) { \
-        v = vb; \
-        ev = eb; \
-        side = 1.0; \
-    } \
-    @} \
-    float Q = ev; \
-    @if (neigh > 0) { \
-    /* the vectors of both fields at the pixel and around it, each weighed */ \
-    /* by its quality and by how well the two frames agree along it */ \
     vec4 gs = vec4(0.0), fs = vec4(0.0); \
-    float fw = 0.0; \
     vec2 vs = vec2(0.0); \
-    float ws = 0.0, qs = 0.0, v2 = 0.0; \
+    float ws = 0.0, fw = 0.0, qs = 0.0, v2 = 0.0; \
     float sf = 0.0, sg = 0.0; \
     vec4 sc = vec4(0.5); \
     for (int k = 0; k < ${const int: ncand}; k++) { \
@@ -3779,36 +3724,34 @@ static bool frame_interp_mix(pl_shader sh,
         } \
         ivec2 pk = clamp(ip + o, ivec2(0), size - 1); \
         vec2 vk = (k & 1) == 0 ? texelFetch($fwd, pk, 0).xy : -texelFetch($bwd, pk, 0).xy; \
-        float ek = m_eval(c0, vk, t); \
         vec2 ka = c0 - t * vk, kb = c0 + (1.0 - t) * vk; \
-        vec4 ca = m_sa((ka + 0.5) * isz), cb = m_sb((kb + 0.5) * isz); \
+        vec2 na = (ka + 0.5) * isz, nb = (kb + 0.5) * isz; \
+        /* a side that is out of the frame does not count */ \
         float ia = m_in(ka, fsz), ib = m_in(kb, fsz); \
-        float ph = ia * ib * abs(m_luma(ca) - m_luma(cb)); \
-        float wk = (ek + 0.02) * exp(-ph * ph * ${float: inv_sigma}) + 1e-9; \
+        float qk = min(mix(1.0, textureLod($qfwd, na, 0.0).x, ia), \
+                       mix(1.0, textureLod($qbwd, nb, 0.0).x, ib)) * max(ia, ib); \
+        vec4 ca = m_sa(na), cb = m_sb(nb); \
         float ua = (1.0 - t) * ia, ub = t * ib; \
         vec4 ck = ua + ub > 0.0 ? (ua * ca + ub * cb) / (ua + ub) : mix(ca, cb, t); \
-        /* for the fallback, by the agreement alone */ \
-        float wf = exp(-ph * ph * ${float: inv_sigma}) + 1e-9; \
+        float wk = qk + 0.02; \
         if (k == ${int: mp->stat_cand}) { \
-            sf = wf; \
+            sf = 1.0; \
             sg = wk; \
             sc = ck; \
         } \
-        fs += wf * ck; \
-        fw += wf; \
+        fs += ck; \
+        fw += 1.0; \
         gs += wk * ck; \
         vs += wk * vk; \
         ws += wk; \
-        qs += wk * ek; \
+        qs += wk * qk; \
         v2 += wk * dot(vk, vk); \
     } \
-    v = vs / ws; \
-    Q = qs / ws; \
-    /* where they agree, one sample along their mean instead */ \
+    vec2 v = vs / ws; \
+    float Q = qs / ws; \
+    /* where the vectors agree, one sample along their mean */ \
     float agree = exp(-max(v2 / ws - dot(v, v), 0.0)); \
-    @} \
     vec2 qa = c0 - t * v, qb = c0 + (1.0 - t) * v; \
-    vec4 za = m_sa(pa), zb = m_sb(pb); \
     vec4 ga, gb; \
     @if (sharp) { \
     ga = ${cubic[0]}((qa + 0.5) * isz); \
@@ -3819,39 +3762,9 @@ static bool frame_interp_mix(pl_shader sh,
     @} \
     float wa = (1.0 - t) * m_in(qa, fsz), wb = t * m_in(qb, fsz); \
     vec4 G = wa + wb > 0.0 ? (wa * ga + wb * gb) / (wa + wb) : mix(ga, gb, t); \
-    @if (neigh > 0) \
-        G = mix(gs / ws, G, agree); \
-    /* fallback */ \
-    vec4 F = mix(za, zb, t); \
-    vec4 plain = F; \
-    vec2 V = vec2(0.0); \
-    float wv = 0.0; \
-    float ef = abs(m_luma(za) - m_luma(zb)); \
-    @if (fallback == 1) { \
-    V = v; \
-    wv = 1.0; \
-    @} \
-    @if (fallback == 2 || fallback == 3) { \
-    vec2 bp = P / vec2(${const float: bgw}, ${const float: bgh}); \
-    V = 0.5 * (textureLod($blkf, bp, 0.0).xy - textureLod($blkb, bp, 0.0).xy); \
-    wv = 1.0; \
-    @} \
-    @if (fallback >= 1 && fallback <= 3) { \
-    vec4 fa = m_sa((c0 - t * V + 0.5) * isz), fb = m_sb((c0 + (1.0 - t) * V + 0.5) * isz); \
-    float ev1 = abs(m_luma(fa) - m_luma(fb)); \
-    @if (fallback == 3) \
-        wv = exp(-max(ev1 * ev1 - ef * ef, 0.0) * ${float: inv_sigma}); \
-    /* a sample out of the frame does not count */ \
-    float ua = (1.0 - t) * m_in(c0 - t * V, fsz), ub = t * m_in(c0 + (1.0 - t) * V, fsz); \
-    F = mix(F, ua + ub > 0.0 ? (ua * fa + ub * fb) / (ua + ub) : mix(fa, fb, t), wv); \
-    ef = mix(ef, ev1, wv); \
-    @} \
-    @if (fallback == 4 && neigh > 0) \
-        F = (fs + ${float: mp->giveup} * F) / (fw + ${float: mp->giveup}); \
-    @if (veto) { \
-    float eg = max(abs(m_luma(ga) - m_luma(gb)) - ef, 0.0); \
-    Q *= exp(-eg * eg * ${float: inv_veto}); \
-    @} \
+    G = mix(gs / ws, G, agree); \
+    vec4 mixed = mix(m_sa(pa), m_sb(pb), t); \
+    vec4 F = mix(fs / fw, mixed, ${float: plain}); \
     color = mix(F, G, Q); \
     @if (show == 1) \
         color = vec4(vec3(Q), 1.0); \
@@ -3859,22 +3772,16 @@ static bool frame_interp_mix(pl_shader sh,
         color = G; \
     @if (show == 3) \
         color = F; \
-    @if (show == 4) \
-        color = vec4(0.5 + V / 64.0, 0.5, 1.0); \
-    @if (show == 6 && neigh > 0) { \
-    /* share of one vector (or, past the last, of plain mixing) in the */ \
-    /* output through F, through G, and in F */ \
-    float fden = fw + ${float: mp->giveup}; \
-    if (${int: mp->stat_cand} >= ${const int: ncand}) \
-        sf = ${float: mp->giveup}; \
-    color = vec4((1.0 - Q) * sf / fden, Q * sg / ws, sf / fden, 1.0); \
+    @if (show == 4) { \
+    /* share of one vector in the output through F, through G, and in F */ \
+    color = vec4((1.0 - Q) * (1.0 - ${float: plain}) * sf / fw, Q * sg / ws, sf / fw, 1.0); \
     @} \
-    @if ((show == 7 || show == 8) && neigh > 0) { \
+    @if (show == 5 || show == 6) { \
     /* the sample of one vector and its score in the fallback; past the */ \
     /* last vector plain mixing, -1 the fallback, -2 the compensated sample */ \
     float sw = clamp(sf, 0.0, 1.0); \
     if (${int: mp->stat_cand} >= ${const int: ncand}) { \
-        sc = plain; \
+        sc = mixed; \
         sw = 1.0; \
     } \
     if (${int: mp->stat_cand} == -1) { \
@@ -3885,17 +3792,12 @@ static bool frame_interp_mix(pl_shader sh,
         sc = G; \
         sw = 1.0; \
     } \
-    @if (show == 7) \
+    @if (show == 5) \
         color = vec4(mix(vec3(0.5), sc.rgb, sw), 1.0); \
     /* for measuring: 1 - Q in the integer part of alpha, the score in */ \
     /* its fraction */ \
-    @if (show == 8) \
+    @if (show == 6) \
         color = vec4(sc.rgb, floor((1.0 - Q) * 255.0) + 0.99 * sw); \
-    @} \
-    @if (show == 5) { \
-    float differ = 1.0 - exp(-dot(vf - vb, vf - vb)); \
-    color = mix(vec4(vec3(0.3 * m_luma(G)), 1.0), \
-                vec4(1.0 - side, 0.0, side, 1.0), differ); \
     @} \
     }
     // clang-format on

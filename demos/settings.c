@@ -484,8 +484,7 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 struct pl_frame_interp_mix_params *mx = &ipar->mix;
                 static const char *shows[] = {
                     "Result", "Quality Q", "Compensated sample", "Fallback",
-                    "Fallback vector V", "Field picked", "Candidate: share",
-                    "Candidate: sample by score",
+                    "Candidate: share", "Candidate: sample",
                 };
                 static const char *cands[] = {
                     "Compensated sample", "Fallback", "Own, forward",
@@ -494,19 +493,17 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                     "Below, backward", "Above, forward", "Above, backward",
                     "Plain mixing",
                 };
-                static const char *picks[] = {
-                    "Forward field", "Nearer frame", "Higher quality",
-                };
-                static const char *fallbacks[] = {
-                    "Plain frame mixing", "Own vector", "Block motion",
-                    "None or block motion", "Neighbour vectors",
-                };
                 static const char *cleans[] = {
                     "Off", "Median", "Median + minimum",
                 };
                 nk_layout_row_dynamic(nk, 24, 2);
+                nk_property_float(nk, "Plain mixing", 0.0f, &mx->plain,
+                                  1.0f, 0.05f, 0.005f);
+                nk_property_float(nk, "Neighbours (px)", 0.0f, &mx->neigh,
+                                  32.0f, 1.0f, 0.1f);
+                nk_checkbox_label(nk, "Bicubic sample", &mx->sharp);
                 nk_label(nk, "Show:", NK_TEXT_LEFT);
-                mx->show = nk_combo(nk, shows, 8, mx->show, 16,
+                mx->show = nk_combo(nk, shows, 6, mx->show, 16,
                                     nk_vec2(nk_widget_width(nk), 300));
                 nk_label(nk, "Candidate:", NK_TEXT_LEFT);
                 mx->stat_cand = nk_combo(nk, cands, 13, NK_CLAMP(-2, mx->stat_cand, 10) + 2, 16,
@@ -519,26 +516,9 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 nk_checkbox_flags_label(nk, "Neighbours bwd", &mask, 0x2A8);
                 mx->cand_mask = mask == 0x3FF ? 0 : mask;
                 nk_layout_row_dynamic(nk, 24, 2);
-                nk_label(nk, "Vector from:", NK_TEXT_LEFT);
-                mx->pick = nk_combo(nk, picks, 3, mx->pick, 16,
-                                    nk_vec2(nk_widget_width(nk), 300));
-                nk_label(nk, "Fallback along:", NK_TEXT_LEFT);
-                mx->fallback = nk_combo(nk, fallbacks, 5, mx->fallback, 16,
-                                        nk_vec2(nk_widget_width(nk), 300));
                 nk_label(nk, "Quality cleaning:", NK_TEXT_LEFT);
                 mx->clean = nk_combo(nk, cleans, 3, mx->clean, 16,
                                      nk_vec2(nk_widget_width(nk), 300));
-                nk_property_float(nk, "Neighbours (px)", 0.0f, &mx->neigh,
-                                  32.0f, 1.0f, 0.1f);
-                nk_property_float(nk, "Mismatch tolerance", 0.01f, &mx->sigma,
-                                  1.0f, 0.01f, 0.001f);
-                nk_property_float(nk, "Consistency (px)", 0.0f, &mx->consist,
-                                  16.0f, 0.1f, 0.01f);
-                nk_property_float(nk, "Plain mixing weight", 0.0f, &mx->giveup,
-                                  4.0f, 0.01f, 0.001f);
-                nk_property_float(nk, "Photometric veto", 0.0f, &mx->veto,
-                                  1.0f, 0.01f, 0.001f);
-                nk_checkbox_label(nk, "Bicubic sample", &mx->sharp);
                 nk_property_float(nk, "Q: hidden", 0.0f, &mx->q_vis,
                                   1.0f, 0.05f, 0.01f);
                 nk_property_float(nk, "Q: cost low", 0.0f, &mx->q_cost_lo,
